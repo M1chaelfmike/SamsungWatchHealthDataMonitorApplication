@@ -1,0 +1,72 @@
+<resources>
+    <string name="app_name">EDATracking</string>
+
+    <!--    Messages-->
+    <string name="connected_to_hts">Connected to Health Tracking Service</string>
+    <string name="disconnected_from_hts">Disconnected from Health Tracking Service</string>
+    <string name="tracker_unavailable">EDA tracker is not available on this device</string>
+    <string name="permission_not_granted">User permission is required. Grant permission in App settings.</string>
+    <string name="error_other">Error has occurred. Check logs for more details.</string>
+    <string name="tracker_not_initialized">EDA tracker is not initialized</string>
+    <string name="permission_not_set">Permission is not set</string>
+    <string name="eda_tracking_in_use">EDA is already being used by Page 3 continuous tracking.</string>
+
+    <!--    UI-->
+    <string name="app_title">EDA\nMeasurement</string>
+    <string name="value">Value (µS)</string>
+    <string name="status">Status</string>
+    <string name="status_normal">Normal</string>
+    <string name="status_detached">Detached</string>
+    <string name="status_low_signal">Low signal</string>
+    <string name="empty_value">——</string>
+    <string name="start">START</string>
+    <string name="stop">STOP</string>
+    <string name="null_value">n/a</string>
+
+    <string name="skin_temp_title">Skin Temperature</string>
+    <string name="skin_temp_header_default">Press Measure to start tracker.</string>
+    <string name="skin_temp_header_measuring">Tracker performing measurement.</string>
+    <string name="skin_temp_header_done">Tracker stopped.</string>
+    <string name="skin_temp_ambient_label">Ambient
+Temperature</string>
+    <string name="skin_temp_wrist_label">Wrist skin
+Temperature</string>
+    <string name="skin_temp_button_default">MEASURE</string>
+    <string name="skin_temp_button_measuring">MEASURING...</string>
+    <string name="skin_temp_no_connection_message">No connection to Health Tracking Service.</string>
+    <string name="skin_temp_not_available_message">Skin temperature measurement not available on the device.</string>
+    <string name="skin_temp_permission_title">No permission</string>
+    <string name="skin_temp_permission_required">User permission is required. Grant permission in App settings.</string>
+    <string name="skin_temp_sdk_policy_error_message">Health Platform has to be set in DEV mode to use this app.</string>
+    <string name="skin_temp_connection_error">Could not connect to Health Tracking Service.</string>
+    <string name="skin_temp_invalid_measurement">Invalid skin temperature measurement.</string>
+    <string name="skin_temp_settings">Settings</string>
+    <string name="skin_temp_not_now">Not now</string>
+
+    <string name="continuous_page_title">Continuous
+EDA + Skin Temp</string>
+    <string name="continuous_tracking_active">Continuous tracking is active.</string>
+    <string name="continuous_tracking_disabled">Continuous tracking is not available on this device.</string>
+    <string name="continuous_waiting_data">Connecting and waiting for data.</string>
+    <string name="continuous_permission_title">Missing permissions</string>
+    <string name="continuous_permission_required">Page 3 requires skin temperature and heart rate permissions.</string>
+    <string name="continuous_permission_missing_detail">Missing permissions:
+%1$s</string>
+    <string name="continuous_error_other">Continuous tracking error.</string>
+    <string name="continuous_skin_object_label">Wrist Skin</string>
+    <string name="continuous_ambient_label">Ambient</string>
+    <string name="continuous_timestamp_label">Timestamp</string>
+    <string name="continuous_auto_refresh">Auto refresh</string>
+    <string name="continuous_skin_invalid">Invalid</string>
+    <string name="continuous_missing_both">This device does not support continuous EDA and skin temperature.</string>
+    <string name="continuous_missing_eda">This device does not support continuous EDA.</string>
+    <string name="continuous_missing_skin_temp">This device does not support continuous skin temperature.</string>
+    <string name="continuous_missing_sensors">Continuous sensors unavailable: %1$s.</string>
+    <string name="continuous_eda_in_use">EDA is already being used by Page 1 measurement.</string>
+    <string name="continuous_connection_chip">Connection</string>
+    <string name="continuous_tracking_chip">Tracking</string>
+    <string name="continuous_state_connected">Connected</string>
+    <string name="continuous_state_disconnected">Disconnected</string>
+    <string name="continuous_state_tracking">Tracking</string>
+    <string name="continuous_state_idle">Idle</string>
+</resources>

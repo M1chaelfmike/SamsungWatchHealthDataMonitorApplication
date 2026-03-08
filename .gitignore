@@ -1,0 +1,18 @@
+.gradle/
+**/build/
+local.properties
+.kotlin/
+
+# Android Studio
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+.idea/deploymentTargetDropDown.xml
+.idea/deviceManager.xml
+
+# OS files
+.DS_Store
+Thumbs.db
