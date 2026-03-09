@@ -69,4 +69,21 @@ EDA + Skin Temp</string>
     <string name="continuous_state_disconnected">Disconnected</string>
     <string name="continuous_state_tracking">Tracking</string>
     <string name="continuous_state_idle">Idle</string>
+    <string name="continuous_service_title">Continuous Tracking Active</string>
+    <string name="continuous_service_running_title">Continuous Tracking Running</string>
+    <string name="continuous_service_paused_title">Continuous Tracking Paused</string>
+    <string name="continuous_service_text">Sensors and uploads keep running in background.</string>
+    <string name="continuous_service_waiting_connection_text">Waiting for Health Tracking Service connection.</string>
+    <string name="continuous_service_measuring_text">Measuring sensors and preparing uploads.</string>
+    <string name="continuous_service_last_upload_text">Last upload at %1$s.</string>
+    <string name="continuous_service_channel_name">Continuous tracking</string>
+    <string name="continuous_service_channel_description">Keeps health sensor collection and upload running in background.</string>
+    <string name="continuous_service_unworn_text">Watch not worn. Measurement paused, wear state still uploading.</string>
+    <string name="continuous_upload_target_title">Upload target</string>
+    <string name="continuous_upload_target_host">Target IP</string>
+    <string name="continuous_upload_target_port">Target port</string>
+    <string name="continuous_upload_target_edit">Edit</string>
+    <string name="continuous_upload_target_save">Save</string>
+    <string name="continuous_upload_target_saved">Upload target updated.</string>
+    <string name="continuous_upload_target_invalid">Please enter a valid IP/host and port.</string>
 </resources>

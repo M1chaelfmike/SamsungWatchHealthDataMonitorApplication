@@ -12,7 +12,8 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,7 +24,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Surface
@@ -41,7 +41,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -50,6 +49,10 @@ import com.samsung.health.sensorsdksample.edatracking.R
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousConnectionState
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingMessageState
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingProgressState
+import com.samsung.health.sensorsdksample.edatracking.data.EdaWindowLabel
+import com.samsung.health.sensorsdksample.edatracking.data.SkinTempStatus
+import com.samsung.health.sensorsdksample.edatracking.data.UploadedSnapshot
+import com.samsung.health.sensorsdksample.edatracking.data.WearStatusSnapshot
 import com.samsung.health.sensorsdksample.edatracking.presentation.theme.AppTypography
 import com.samsung.health.sensorsdksample.edatracking.presentation.theme.PaddingMedium
 import com.samsung.health.sensorsdksample.edatracking.presentation.theme.SpacerMedium
@@ -59,7 +62,6 @@ import java.util.Locale
 @Composable
 fun ContinuousMonitoringPage(
     viewModel: ContinuousTrackingViewModel,
-    isActive: Boolean,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -67,8 +69,12 @@ fun ContinuousMonitoringPage(
     val dataState by viewModel.dataState.collectAsState()
     val progressState by viewModel.progressState.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
+    val wearStatusSnapshot = dataState.wearStatusSnapshot
     var showSettingsPrompt by remember { mutableStateOf(false) }
-    val missingPermissionText = remember(context, connectionState, progressState, isActive) {
+    var showUploadTargetDialog by remember { mutableStateOf(false) }
+    var uploadHostInput by remember { mutableStateOf(dataState.uploadHost) }
+    var uploadPortInput by remember { mutableStateOf(dataState.uploadPort.toString()) }
+    val missingPermissionText = remember(context, connectionState, progressState) {
         buildMissingPermissionsText(context)
     }
 
@@ -77,9 +83,7 @@ fun ContinuousMonitoringPage(
     ) { results ->
         val granted = requiredContinuousPermissions().all { permission -> results[permission] == true }
         if (granted) {
-            if (isActive && connectionState == ContinuousConnectionState.Connected) {
-                viewModel.startTracking()
-            }
+            viewModel.startBackgroundTracking(context)
         } else if (activity != null && requiredContinuousPermissions().all { permission ->
                 !ActivityCompat.shouldShowRequestPermissionRationale(activity, permission)
             }
@@ -120,6 +124,10 @@ fun ContinuousMonitoringPage(
                     ).show()
                 }
 
+                is ContinuousTrackingMessageState.Info -> {
+                    Toast.makeText(context, messageState.message, Toast.LENGTH_SHORT).show()
+                }
+
                 is ContinuousTrackingMessageState.TrackingInUse -> {
                     Toast.makeText(context, context.getString(R.string.continuous_eda_in_use), Toast.LENGTH_SHORT).show()
                 }
@@ -127,37 +135,15 @@ fun ContinuousMonitoringPage(
         }
     }
 
-    LaunchedEffect(isActive) {
-        if (isActive) {
-            viewModel.connect()
-        } else {
-            viewModel.stopTracking()
-            viewModel.disconnect()
-        }
-    }
-
-    LaunchedEffect(isActive, connectionState, progressState) {
-        if (!isActive) {
-            return@LaunchedEffect
-        }
-        if (connectionState != ContinuousConnectionState.Connected) {
-            return@LaunchedEffect
-        }
+    LaunchedEffect(connectionState, progressState) {
         if (progressState == ContinuousTrackingProgressState.Tracking || progressState == ContinuousTrackingProgressState.TrackingDisabled) {
             return@LaunchedEffect
         }
 
         if (hasContinuousPermissions(context)) {
-            viewModel.startTracking()
+            viewModel.startBackgroundTracking(context)
         } else {
             permissionLauncher.launch(requiredContinuousPermissions())
-        }
-    }
-
-    DisposableEffect(viewModel) {
-        onDispose {
-            viewModel.stopTracking()
-            viewModel.disconnect()
         }
     }
 
@@ -188,105 +174,299 @@ fun ContinuousMonitoringPage(
         )
     }
 
-    val edaValue = dataState.edaValue
-    val skinTempValue = dataState.skinTempValue
-    val heartRateValue = dataState.heartRateValue
-    val ppgValue = dataState.ppgValue
+    if (showUploadTargetDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showUploadTargetDialog = false },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        val port = uploadPortInput.toIntOrNull()
+                        if (uploadHostInput.isBlank() || port == null || port !in 1..65535) {
+                            Toast.makeText(
+                                context,
+                                context.getString(R.string.continuous_upload_target_invalid),
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@TextButton
+                        }
 
-    val edaLines = listOf(
-        edaValue?.skinConductance?.let { String.format(Locale.getDefault(), "%.3f µS", it) }
-            ?: stringResource(R.string.null_value)
-    )
-
-    val skinTempLines = listOf(
-        skinTempValue?.wristSkinTemperature?.let { String.format(Locale.getDefault(), "WS %.1f°C", it) }
-            ?: "WS ${stringResource(R.string.null_value)}",
-        skinTempValue?.ambientTemperature?.let { String.format(Locale.getDefault(), "AT %.1f°C", it) }
-            ?: "AT ${stringResource(R.string.null_value)}"
-    )
-
-    val heartRateLines = listOf(
-        heartRateValue?.heartRate?.let { "$it bpm" }
-            ?: "-- bpm"
-    )
-
-    val ppgLines = listOf(
-        ppgValue?.green?.let { "G $it" } ?: "G --",
-        ppgValue?.red?.let { "R $it" } ?: "R --",
-        ppgValue?.ir?.let { "IR $it" } ?: "IR --"
-    )
-
-    BoxWithConstraints(
-        modifier = modifier.fillMaxSize()
-    ) {
-        val outerPadding = 10.dp
-        val cardSpacing = 8.dp
-        val rowSpacing = 8.dp
-        val contentWidth = maxWidth - outerPadding * 2
-        val contentHeight = maxHeight - outerPadding * 2
-        val statusSectionHeight = 18.dp
-        val cardWidth = (contentWidth - cardSpacing) / 2
-        val computedCardHeight = (contentHeight - statusSectionHeight - rowSpacing * 2) / 2
-        val cardHeight = if (computedCardHeight > 92.dp) 92.dp else computedCardHeight
-
-        Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.TopCenter
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(outerPadding),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(rowSpacing)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
+                        viewModel.updateUploadTarget(uploadHostInput.trim(), port)
+                        showUploadTargetDialog = false
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.continuous_upload_target_saved),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
                 ) {
-                    ContinuousStatusIndicator(active = connectionState == ContinuousConnectionState.Connected)
-                    Spacer(modifier = Modifier.size(8.dp))
-                    ContinuousStatusIndicator(active = progressState == ContinuousTrackingProgressState.Tracking)
+                    androidx.compose.material3.Text(text = stringResource(R.string.continuous_upload_target_save))
                 }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(cardSpacing)
-                ) {
-                    ContinuousMetricBlock(
-                        title = "EDA",
-                        lines = edaLines,
-                        cardHeight = cardHeight,
-                        modifier = Modifier.width(cardWidth)
-                    )
-                    ContinuousMetricBlock(
-                        title = "ST",
-                        lines = skinTempLines,
-                        cardHeight = cardHeight,
-                        modifier = Modifier.width(cardWidth)
-                    )
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { showUploadTargetDialog = false }) {
+                    androidx.compose.material3.Text(text = stringResource(R.string.skin_temp_not_now))
                 }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(cardSpacing)
-                ) {
-                    ContinuousMetricBlock(
-                        title = "HR",
-                        lines = heartRateLines,
-                        cardHeight = cardHeight,
-                        modifier = Modifier.width(cardWidth)
+            },
+            title = {
+                androidx.compose.material3.Text(text = stringResource(R.string.continuous_upload_target_title))
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    androidx.compose.material3.TextField(
+                        value = uploadHostInput,
+                        onValueChange = { uploadHostInput = it },
+                        singleLine = true,
+                        label = {
+                            androidx.compose.material3.Text(text = stringResource(R.string.continuous_upload_target_host))
+                        }
                     )
-                    ContinuousMetricBlock(
-                        title = "PPG",
-                        lines = ppgLines,
-                        cardHeight = cardHeight,
-                        modifier = Modifier.width(cardWidth)
+                    androidx.compose.material3.TextField(
+                        value = uploadPortInput,
+                        onValueChange = { uploadPortInput = it },
+                        singleLine = true,
+                        label = {
+                            androidx.compose.material3.Text(text = stringResource(R.string.continuous_upload_target_port))
+                        }
                     )
                 }
             }
+        )
+    }
+
+    val edaValue = dataState.edaValue
+    val skinTempValue = dataState.skinTempValue
+    val heartRateValue = dataState.heartRateValue
+    val liveHeartRateValue = dataState.liveHeartRateValue
+    val lastUploadedSnapshot = dataState.lastUploadedSnapshot
+
+    val edaLines = listOf(
+        edaValue?.skinConductance?.let { String.format(Locale.getDefault(), "%.3f", it) } ?: "Waiting EDA",
+        dataState.edaLabel?.let { "Label ${it.name}" } ?: "Listening",
+        "Valid ${dataState.edaValidSampleCount} pts",
+        dataState.lastEdaUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No EDA update"
+    )
+
+    val skinTempLines = listOf(
+        skinTempValue?.wristSkinTemperature?.let { String.format(Locale.getDefault(), "WS %.2f°C", it) } ?: "Waiting TEMP",
+        skinTempStatusLabel(skinTempValue?.status),
+        skinTempValue?.ambientTemperature?.let { String.format(Locale.getDefault(), "AT %.2f°C", it) } ?: "AT --",
+        dataState.lastSkinTempUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No TEMP update"
+    )
+
+    val heartRateLines = listOf(
+        heartRateValue?.heartRate?.let { "$it bpm" } ?: "Waiting HR",
+        heartRateStatusLabel(heartRateValue?.status),
+        heartRateLiveLabel(liveHeartRateValue),
+        dataState.lastHeartRateUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No HR update"
+    )
+
+    val uploadLines = uploadSummaryLines(
+        snapshot = lastUploadedSnapshot,
+        emptyText = stringResource(R.string.null_value)
+    )
+
+    val uploadTargetLines = listOf(
+        dataState.uploadHost,
+        "Port ${dataState.uploadPort}",
+        "HTTP POST /"
+    )
+
+    val serviceLines = serviceStatusLines(
+        connectionState = connectionState,
+        progressState = progressState,
+        wearStatusSnapshot = wearStatusSnapshot
+    )
+
+    Box(
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(12.dp)
+                .verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                LabeledStatusIndicator(
+                    label = "HTS",
+                    active = connectionState == ContinuousConnectionState.Connected
+                )
+                LabeledStatusIndicator(
+                    label = "RUN",
+                    active = progressState == ContinuousTrackingProgressState.Tracking
+                )
+                LabeledStatusIndicator(
+                    label = "WEAR",
+                    active = wearStatusSnapshot?.isWorn == true,
+                    inactiveColor = Color(0xFFE39B9B),
+                    unknown = wearStatusSnapshot == null
+                )
+            }
+
+            ContinuousMetricBlock(
+                title = "SERVICE",
+                lines = serviceLines,
+                cardHeight = 110.dp,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            ContinuousMetricBlock(
+                title = "EDA",
+                lines = edaLines,
+                cardHeight = 110.dp,
+                modifier = Modifier.fillMaxWidth()
+            )
+            ContinuousMetricBlock(
+                title = "HR",
+                lines = heartRateLines,
+                cardHeight = 130.dp,
+                modifier = Modifier.fillMaxWidth()
+            )
+            ContinuousMetricBlock(
+                title = "TEMP",
+                lines = skinTempLines,
+                cardHeight = 120.dp,
+                modifier = Modifier.fillMaxWidth()
+            )
+            ContinuousMetricBlock(
+                title = "UPLOAD",
+                lines = uploadLines,
+                cardHeight = 145.dp,
+                modifier = Modifier.fillMaxWidth()
+            )
+            EditableMetricBlock(
+                title = "TARGET",
+                lines = uploadTargetLines,
+                buttonLabel = stringResource(R.string.continuous_upload_target_edit),
+                onEditClick = {
+                    uploadHostInput = dataState.uploadHost
+                    uploadPortInput = dataState.uploadPort.toString()
+                    showUploadTargetDialog = true
+                },
+                cardHeight = 132.dp,
+                modifier = Modifier.fillMaxWidth()
+            )
         }
+    }
+}
+
+private fun edaApplicationLines(
+    label: EdaWindowLabel?,
+    validSampleCount: Int
+): List<String> {
+    return when (label) {
+        EdaWindowLabel.DETACHED -> listOf(
+            "Wear Check",
+            "Put the watch firmly on wrist",
+            "Waiting for valid EDA samples"
+        )
+
+        EdaWindowLabel.LOW_SIGNAL -> listOf(
+            "Contact Weak",
+            "Tighten the watch and keep still",
+            "Upload resumes on valid samples"
+        )
+
+        EdaWindowLabel.STABLE,
+        EdaWindowLabel.RISING,
+        EdaWindowLabel.RECOVERING,
+        EdaWindowLabel.VARIABLE -> listOf(
+            "Live Stream",
+            "Valid $validSampleCount pts",
+            "Upload each valid sample"
+        )
+
+        EdaWindowLabel.WAITING, null -> listOf(
+            "Listening",
+            "Valid $validSampleCount pts",
+            "Upload each valid sample"
+        )
+    }
+}
+
+@Composable
+private fun skinTempStatusLabel(status: SkinTempStatus?): String {
+    return when (status) {
+        SkinTempStatus.SUCCESSFUL_MEASUREMENT -> "Status SUCCESS"
+        SkinTempStatus.INVALID_MEASUREMENT -> "Status INVALID"
+        SkinTempStatus.UNKNOWN -> "Status UNKNOWN"
+        null -> "Status WAITING"
+    }
+}
+
+@Composable
+private fun heartRateStatusLabel(status: Int?): String {
+    return status?.let { "Status $it" } ?: "Status WAITING"
+}
+
+private fun heartRateLiveLabel(value: com.samsung.health.sensorsdksample.edatracking.data.HeartRateValue?): String {
+    val heartRateText = value?.heartRate?.let { "$it bpm" } ?: "--"
+    val statusText = value?.status?.toString() ?: "--"
+    return "Live $heartRateText / S$statusText"
+}
+
+private fun uploadSummaryLines(
+    snapshot: UploadedSnapshot?,
+    emptyText: String
+): List<String> {
+    if (snapshot == null) {
+        return listOf(
+            "Last Send",
+            emptyText,
+            "Waiting for success",
+            ""
+        )
+    }
+
+    return listOf(
+        "At ${formatClockTime(snapshot.uploadedAtMillis)}",
+        snapshot.sensorType,
+        snapshot.primaryText,
+        snapshot.secondaryText.orEmpty()
+    )
+}
+
+private fun formatClockTime(timeMillis: Long): String {
+    val calendar = java.util.Calendar.getInstance().apply {
+        timeInMillis = timeMillis
+    }
+    return String.format(
+        Locale.getDefault(),
+        "%02d:%02d:%02d",
+        calendar.get(java.util.Calendar.HOUR_OF_DAY),
+        calendar.get(java.util.Calendar.MINUTE),
+        calendar.get(java.util.Calendar.SECOND)
+    )
+}
+
+@Composable
+private fun LabeledStatusIndicator(
+    label: String,
+    active: Boolean,
+    inactiveColor: Color = Color(0xFFE5E5E5),
+    unknown: Boolean = false
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        ContinuousStatusIndicator(
+            active = active,
+            inactiveColor = if (unknown) Color(0xFFD5D5D5) else inactiveColor
+        )
+        Text(
+            text = label,
+            style = AppTypography.bodySmall,
+            color = Color.Black,
+            textAlign = TextAlign.Center
+        )
     }
 }
 
@@ -305,13 +485,13 @@ private fun ContinuousMetricBlock(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 6.dp, vertical = 8.dp),
+                .padding(horizontal = 10.dp, vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
             Text(
                 text = title,
-                style = AppTypography.bodySmall.copy(fontSize = 11.sp),
+                style = AppTypography.bodySmall,
                 textAlign = TextAlign.Center,
                 color = Color.Black
             )
@@ -319,7 +499,7 @@ private fun ContinuousMetricBlock(
             lines.forEachIndexed { index, line ->
                 Text(
                     text = line,
-                    style = AppTypography.bodySmall.copy(fontSize = 10.sp),
+                    style = AppTypography.bodySmall,
                     textAlign = TextAlign.Center,
                     color = Color.Black
                 )
@@ -332,11 +512,56 @@ private fun ContinuousMetricBlock(
 }
 
 @Composable
-private fun ContinuousStatusIndicator(
-    active: Boolean
+private fun EditableMetricBlock(
+    title: String,
+    lines: List<String>,
+    buttonLabel: String,
+    onEditClick: () -> Unit,
+    cardHeight: androidx.compose.ui.unit.Dp,
+    modifier: Modifier = Modifier
 ) {
     Surface(
-        color = if (active) Color(0xFFB8E6C2) else Color(0xFFE5E5E5),
+        modifier = modifier.height(cardHeight),
+        color = Color(0xFFF3F3F3),
+        shape = RoundedCornerShape(20.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = title,
+                style = AppTypography.bodySmall,
+                textAlign = TextAlign.Center,
+                color = Color.Black
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            lines.forEach { line ->
+                Text(
+                    text = line,
+                    style = AppTypography.bodySmall,
+                    textAlign = TextAlign.Center,
+                    color = Color.Black
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+            }
+            androidx.compose.material3.TextButton(onClick = onEditClick) {
+                androidx.compose.material3.Text(text = buttonLabel)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContinuousStatusIndicator(
+    active: Boolean,
+    inactiveColor: Color = Color(0xFFE5E5E5)
+) {
+    Surface(
+        color = if (active) Color(0xFFB8E6C2) else inactiveColor,
         shape = CircleShape,
         modifier = Modifier.size(10.dp)
     ) {
@@ -345,7 +570,7 @@ private fun ContinuousStatusIndicator(
 }
 
 private fun requiredContinuousPermissions(): Array<String> {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
+    val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
         arrayOf(
             "com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA",
             HealthPermissions.READ_SKIN_TEMPERATURE,
@@ -353,6 +578,12 @@ private fun requiredContinuousPermissions(): Array<String> {
         )
     } else {
         arrayOf(Manifest.permission.BODY_SENSORS)
+    }
+
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        permissions + Manifest.permission.POST_NOTIFICATIONS
+    } else {
+        permissions
     }
 }
 
@@ -380,6 +611,7 @@ private fun buildMissingPermissionsText(context: Context): String {
             HealthPermissions.READ_SKIN_TEMPERATURE -> "READ_SKIN_TEMPERATURE"
             HealthPermissions.READ_HEART_RATE -> "READ_HEART_RATE"
             Manifest.permission.BODY_SENSORS -> "BODY_SENSORS"
+            Manifest.permission.POST_NOTIFICATIONS -> "POST_NOTIFICATIONS"
             else -> permission
         }
     }
@@ -404,9 +636,6 @@ private fun buildUnsupportedSensorsMessage(
     if (!heartRateSupported) {
         missingSensors += "HR"
     }
-    if (!ppgSupported) {
-        missingSensors += "PPG"
-    }
 
     return context.getString(R.string.continuous_missing_sensors, missingSensors.joinToString(", "))
 }
@@ -415,4 +644,28 @@ private fun openAppSettings(context: Context) {
     val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
     intent.data = Uri.fromParts("package", context.packageName, null)
     context.startActivity(intent)
+}
+
+private fun serviceStatusLines(
+    connectionState: ContinuousConnectionState,
+    progressState: ContinuousTrackingProgressState,
+    wearStatusSnapshot: WearStatusSnapshot?
+): List<String> {
+    val connectionText = when (connectionState) {
+        ContinuousConnectionState.Connected -> "HTS Connected"
+        ContinuousConnectionState.Disconnected -> "HTS Disconnected"
+    }
+    val progressText = when (progressState) {
+        ContinuousTrackingProgressState.Tracking -> "Measuring"
+        ContinuousTrackingProgressState.Idle -> "Waiting"
+        ContinuousTrackingProgressState.TrackingDisabled -> "Disabled"
+    }
+    val wearText = when (wearStatusSnapshot?.isWorn) {
+        true -> "Wear On"
+        false -> "Wear Off"
+        null -> "Wear Unknown"
+    }
+    val changedAtText = wearStatusSnapshot?.let { "Since ${formatClockTime(it.changedAtMillis)}" } ?: "Waiting sensor"
+
+    return listOf(connectionText, progressText, wearText, changedAtText)
 }

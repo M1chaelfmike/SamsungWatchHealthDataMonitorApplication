@@ -1,9 +1,11 @@
 package com.samsung.health.sensorsdksample.edatracking.viewModel
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousConnectionState
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousMonitoringData
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingProgressState
+import com.samsung.health.sensorsdksample.edatracking.tracking.ContinuousTrackingForegroundService
 import com.samsung.health.sensorsdksample.edatracking.tracking.ContinuousTrackingManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.StateFlow
@@ -29,6 +31,18 @@ class ContinuousTrackingViewModel @Inject constructor(
 
     fun startTracking() {
         trackingManager.startTracking()
+    }
+
+    fun startBackgroundTracking(context: Context) {
+        ContinuousTrackingForegroundService.start(context)
+    }
+
+    fun stopBackgroundTracking(context: Context) {
+        ContinuousTrackingForegroundService.stop(context)
+    }
+
+    fun updateUploadTarget(host: String, port: Int) {
+        trackingManager.updateUploadTarget(host, port)
     }
 
     fun stopTracking() {

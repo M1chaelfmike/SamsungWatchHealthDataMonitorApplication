@@ -13,5 +13,6 @@ sealed class ContinuousTrackingMessageState {
     data object PermissionError : ContinuousTrackingMessageState()
     data class ResolvableError(val exception: HealthTrackerException) : ContinuousTrackingMessageState()
     data class Error(val errorMessage: String?) : ContinuousTrackingMessageState()
+    data class Info(val message: String) : ContinuousTrackingMessageState()
     data object TrackingInUse : ContinuousTrackingMessageState()
 }
