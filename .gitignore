@@ -2,6 +2,11 @@
 **/build/
 local.properties
 .kotlin/
+received/
+scripts/__pycache__/
+tmp_sdk_inspect/
+app/libs/aar_extract/
+app/libs/*.zip
 
 # Android Studio
 .idea/caches/
