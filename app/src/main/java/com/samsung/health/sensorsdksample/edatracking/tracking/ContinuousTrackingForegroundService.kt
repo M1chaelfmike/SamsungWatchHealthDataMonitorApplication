@@ -12,6 +12,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -49,6 +50,9 @@ class ContinuousTrackingForegroundService : Service() {
     private var sensorManager: SensorManager? = null
     private var wearSensor: Sensor? = null
     private var lastWearState: Boolean? = null
+    private var lastChargingState: Boolean? = null
+    private var lastChargeSource: String? = null
+    private var batteryReceiverRegistered = false
     private var screenReceiverRegistered = false
     private val wearListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
@@ -75,6 +79,11 @@ class ContinuousTrackingForegroundService : Service() {
             }
         }
     }
+    private val batteryStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            handleBatteryIntent(intent)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -96,6 +105,7 @@ class ContinuousTrackingForegroundService : Service() {
         messageLogJob?.cancel()
         messageLogJob = null
         unregisterScreenReceiver()
+        unregisterBatteryReceiver()
         unregisterWearSensor()
         releaseWakeLock()
         trackingManager.stopTracking()
@@ -111,6 +121,7 @@ class ContinuousTrackingForegroundService : Service() {
         ))
         acquireWakeLock()
         registerScreenReceiver()
+        registerBatteryReceiver()
         registerWearSensor()
         trackingManager.connect()
         if (trackingCoordinatorJob == null) {
@@ -191,6 +202,7 @@ class ContinuousTrackingForegroundService : Service() {
         messageLogJob?.cancel()
         messageLogJob = null
         unregisterScreenReceiver()
+        unregisterBatteryReceiver()
         unregisterWearSensor()
         releaseWakeLock()
         trackingManager.stopTracking()
@@ -326,6 +338,66 @@ class ContinuousTrackingForegroundService : Service() {
         if (wearSensor != null) {
             sensorManager?.registerListener(wearListener, wearSensor, SensorManager.SENSOR_DELAY_NORMAL)
         }
+    }
+
+    private fun registerBatteryReceiver() {
+        if (batteryReceiverRegistered) {
+            return
+        }
+
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val initialIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(batteryStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(batteryStateReceiver, filter)
+        }
+        batteryReceiverRegistered = true
+        handleBatteryIntent(initialIntent)
+    }
+
+    private fun unregisterBatteryReceiver() {
+        if (!batteryReceiverRegistered) {
+            return
+        }
+
+        unregisterReceiver(batteryStateReceiver)
+        batteryReceiverRegistered = false
+    }
+
+    private fun handleBatteryIntent(intent: Intent?) {
+        if (intent == null) {
+            return
+        }
+
+        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL
+        val chargeSource = when (intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)) {
+            BatteryManager.BATTERY_PLUGGED_AC -> "AC"
+            BatteryManager.BATTERY_PLUGGED_USB -> "USB"
+            BatteryManager.BATTERY_PLUGGED_WIRELESS -> "WIRELESS"
+            BatteryManager.BATTERY_PLUGGED_DOCK -> "DOCK"
+            else -> "BATTERY"
+        }
+        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+        val batteryLevelPercent = if (level >= 0 && scale > 0) {
+            (level * 100) / scale
+        } else {
+            null
+        }
+
+        if (lastChargingState == isCharging && lastChargeSource == chargeSource) {
+            return
+        }
+
+        lastChargingState = isCharging
+        lastChargeSource = chargeSource
+        trackingManager.onPowerStateChanged(
+            isCharging = isCharging,
+            chargeSource = chargeSource,
+            batteryLevelPercent = batteryLevelPercent
+        )
     }
 
     private fun unregisterWearSensor() {

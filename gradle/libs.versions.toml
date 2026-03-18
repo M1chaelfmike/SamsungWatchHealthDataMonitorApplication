@@ -8,8 +8,6 @@ composeFoundation = "1.5.3"
 wearToolingPreview = "1.0.0"
 activityCompose = "1.11.0"
 coreSplashscreen = "1.0.1"
-material3Android = "1.4.0"
-composeMaterial3 = "1.5.3"
 lifecycleCommon = "2.9.4"
 mockk = "1.14.6"
 junit = "4.13.2"
@@ -33,8 +31,7 @@ compose-foundation = { group = "androidx.wear.compose", name = "compose-foundati
 wear-tooling-preview = { group = "androidx.wear", name = "wear-tooling-preview", version.ref = "wearToolingPreview" }
 activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 core-splashscreen = { group = "androidx.core", name = "core-splashscreen", version.ref = "coreSplashscreen" }
-material3-android = { group = "androidx.compose.material3", name = "material3-android", version.ref = "material3Android" }
-compose-material3 = { group = "androidx.wear.compose", name = "compose-material3", version.ref = "composeMaterial3" }
+compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 lifecycle-common = { group = "androidx.lifecycle", name = "lifecycle-common", version.ref = "lifecycleCommon" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 mockk = { module = "io.mockk:mockk", version.ref = "mockk" }

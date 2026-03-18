@@ -48,4 +48,8 @@ class ContinuousTrackingViewModel @Inject constructor(
     fun stopTracking() {
         trackingManager.stopTracking()
     }
+
+    fun toggleEcgMeasurement() {
+        trackingManager.toggleEcgMeasurement()
+    }
 }

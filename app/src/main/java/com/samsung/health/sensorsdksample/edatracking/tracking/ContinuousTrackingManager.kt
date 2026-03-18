@@ -16,6 +16,7 @@ import com.samsung.health.sensorsdksample.edatracking.data.EDAStatus
 import com.samsung.health.sensorsdksample.edatracking.data.EDAValue
 import com.samsung.health.sensorsdksample.edatracking.data.HeartRateValue
 import com.samsung.health.sensorsdksample.edatracking.data.PpgValue
+import com.samsung.health.sensorsdksample.edatracking.data.PowerStatusSnapshot
 import com.samsung.health.sensorsdksample.edatracking.data.SkinTempStatus
 import com.samsung.health.sensorsdksample.edatracking.data.SkinTempValue
 import com.samsung.health.sensorsdksample.edatracking.data.UploadedSnapshot
@@ -36,6 +37,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -56,6 +58,9 @@ class ContinuousTrackingManager @Inject constructor(
     private val edaSamplingDurationMillis = 30_000L
     private val heartRateSamplingIntervalMillis = 5 * 60 * 1000L
     private val heartRateStabilizationDurationMillis = 10_000L
+    private val ecgMeasurementDurationMillis = 30_000L
+    private val ecgMeasurementTickMillis = 1_000L
+    private val ecgLeadOffNoContact = 5
     private val heartRatePlausibleMinBpm = 35
     private val heartRatePlausibleMaxBpm = 220
     private val tempRetryDelayMillis = 15_000L
@@ -70,25 +75,33 @@ class ContinuousTrackingManager @Inject constructor(
 
     private val samplePollIntervalMillis = 250L
     private val FLUSH_INTERVAL_MILLIS = 1_000L
+    private val pendingUploadQueueKey = "pending_upload_queue_v1"
+    private val maxPendingUploadCount = 512
     private val preferences: SharedPreferences = context.getSharedPreferences("continuous_tracking", Context.MODE_PRIVATE)
     private var isPausedForOffBody = false
 
-    private val defaultUploadHost = "192.168.0.8"
-    private val defaultUploadPort = 8080
+    private val legacyUploadHost = "192.168.0.8"
+    private val legacyUploadPort = 8080
+    private val defaultUploadHost = "192.168.0.5"
+    private val defaultUploadPort = 3100
 
     private var edaTracker: HealthTracker? = null
     private var skinTempTracker: HealthTracker? = null
     private var heartRateTracker: HealthTracker? = null
     private var ppgTracker: HealthTracker? = null
+    private var ecgTracker: HealthTracker? = null
     private var hasConnectionLease = false
     private var hasTrackingOwnership = false
     private var heartRateLoopJob: Job? = null
     private var skinTempLoopJob: Job? = null
     private var edaLoopJob: Job? = null
+    private var ecgMeasurementJob: Job? = null
     private val skinTempSamples = ArrayDeque<TimestampedSkinTempSample>()
     private val skinTempSamplesLock = Any()
     private val edaUploadMutex = Mutex()
     private val heartRateUploadMutex = Mutex()
+    private val pendingUploadQueueMutex = Mutex()
+    private val ecgSamplesLock = Any()
     private var skinTempAcquisitionStartedAtMillis: Long? = null
     private var heartRateAcquisitionStartedAtMillis: Long? = null
     private var edaAcquisitionStartedAtMillis: Long? = null
@@ -105,9 +118,18 @@ class ContinuousTrackingManager @Inject constructor(
     private var lastQueuedHeartRateTimestamp: Long? = null
     private var lastQueuedEdaTimestamp: Long? = null
     private var trackingStartedAtMillis: Long? = null
+    private var ecgSupported = false
+    private var resumeContinuousTrackingAfterEcg = false
+    private var skinTempSupportedForTracking = false
+    private var heartRateSupportedForTracking = false
+    private var edaSupportedForTracking = false
+    private var skinTempCompletedForCurrentRun = false
+    private var heartRateCompletedForCurrentRun = false
+    private var edaCompletedForCurrentRun = false
     private val edaSessionLock = Any()
     private val heartRateSessionLock = Any()
     private val heartRateStableSamples = ArrayDeque<HeartRateValue>()
+    private val ecgSamples = ArrayDeque<EcgSample>()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
@@ -135,6 +157,8 @@ class ContinuousTrackingManager @Inject constructor(
                     checkTrackerAvailability()
                     ContinuousConnectionState.Connected
                 } else {
+                    ecgSupported = false
+                    updateTrackingUiFlags()
                     ContinuousConnectionState.Disconnected
                 }
             }
@@ -285,6 +309,89 @@ class ContinuousTrackingManager @Inject constructor(
         }
     }
 
+    private val ecgTrackerListener = object : HealthTracker.TrackerEventListener {
+        override fun onDataReceived(data: MutableList<DataPoint>) {
+            if (!_dataState.value.ecgMeasurementRunning || data.isEmpty()) {
+                return
+            }
+
+            var leadOffDetected = false
+            val newSamples = mutableListOf<EcgSample>()
+            data.forEach { dataPoint ->
+                val leadOff = dataPoint.getValue(ValueKey.EcgSet.LEAD_OFF)
+                if (leadOff == ecgLeadOffNoContact) {
+                    leadOffDetected = true
+                } else {
+                    val valueMv = dataPoint.getValue(ValueKey.EcgSet.ECG_MV)
+                    newSamples += EcgSample(
+                        timestamp = dataPoint.timestamp,
+                        valueMv = valueMv
+                    )
+                }
+            }
+
+            if (newSamples.isNotEmpty()) {
+                synchronized(ecgSamplesLock) {
+                    ecgSamples.addAll(newSamples)
+                }
+            }
+
+            val latestValue = newSamples.lastOrNull()?.valueMv ?: _dataState.value.ecgCurrentValueMv
+            _dataState.value = _dataState.value.copy(
+                ecgLeadOff = leadOffDetected,
+                ecgCurrentValueMv = latestValue,
+                ecgStatusText = if (leadOffDetected) {
+                    "Keep finger on sensor"
+                } else {
+                    latestValue?.let { String.format(Locale.getDefault(), "%.2f mV", it) } ?: "Measuring"
+                }
+            )
+        }
+
+        override fun onFlushCompleted() {
+            Log.i(APP_TAG, "ECG data flushed")
+        }
+
+        override fun onError(error: HealthTracker.TrackerError) {
+            Log.i(APP_TAG, "ECG onError called: $error")
+            scope.launch {
+                finishEcgMeasurement(success = false, errorMessage = error.name)
+            }
+        }
+    }
+
+    private fun updateTrackingUiFlags() {
+        _dataState.value = _dataState.value.copy(
+            ecgSupported = ecgSupported,
+            isAnySensorCycleActive = skinTempCycleActive || heartRateCycleActive || edaCycleActive,
+            isEcgReadyToStart = isEcgReadyToStart()
+        )
+    }
+
+    private fun isEcgReadyToStart(): Boolean {
+        if (_progressState.value != ContinuousTrackingProgressState.Tracking) {
+            return true
+        }
+
+        val skinTempReady = !skinTempSupportedForTracking || skinTempCompletedForCurrentRun
+        val heartRateReady = !heartRateSupportedForTracking || heartRateCompletedForCurrentRun
+        val edaReady = !edaSupportedForTracking || edaCompletedForCurrentRun
+        return skinTempReady && heartRateReady && edaReady &&
+            !skinTempCycleActive && !heartRateCycleActive && !edaCycleActive
+    }
+
+    private fun resetPrimarySensorCompletionState() {
+        skinTempCompletedForCurrentRun = false
+        heartRateCompletedForCurrentRun = false
+        edaCompletedForCurrentRun = false
+    }
+
+    private fun updateSupportedPrimaryTrackers(availableTrackers: Collection<HealthTrackerType>) {
+        edaSupportedForTracking = availableTrackers.contains(HealthTrackerType.EDA_CONTINUOUS)
+        skinTempSupportedForTracking = availableTrackers.contains(HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS)
+        heartRateSupportedForTracking = availableTrackers.contains(HealthTrackerType.HEART_RATE_CONTINUOUS)
+    }
+
     fun connect() {
         if (hasConnectionLease) {
             return
@@ -324,6 +431,7 @@ class ContinuousTrackingManager @Inject constructor(
         }
 
         val availableTrackers = sharedServiceManager.getSupportedTrackers().orEmpty()
+        updateSupportedPrimaryTrackers(availableTrackers)
         val edaSupported = availableTrackers.contains(HealthTrackerType.EDA_CONTINUOUS)
         val skinTempSupported = availableTrackers.contains(HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS)
         val heartRateSupported = availableTrackers.contains(HealthTrackerType.HEART_RATE_CONTINUOUS)
@@ -357,6 +465,7 @@ class ContinuousTrackingManager @Inject constructor(
 
         cancelSensorLoops()
         trackingStartedAtMillis = System.currentTimeMillis()
+        resetPrimarySensorCompletionState()
         edaAcquisitionStartedAtMillis = null
         heartRateAcquisitionStartedAtMillis = null
         skinTempAcquisitionStartedAtMillis = null
@@ -366,6 +475,7 @@ class ContinuousTrackingManager @Inject constructor(
         skinTempCycleActive = false
         edaCycleActive = false
         heartRateCycleActive = false
+        updateTrackingUiFlags()
         edaValidWindowStartedAtMillis = null
         heartRateValidWindowStartedAtMillis = null
         clearHeartRateStableSamples()
@@ -392,12 +502,14 @@ class ContinuousTrackingManager @Inject constructor(
         lastQueuedEdaTimestamp = null
         lastQueuedHeartRateTimestamp = null
         trackingStartedAtMillis = null
+        resetPrimarySensorCompletionState()
         nextSkinTempCycleAtMillis = 0L
         nextEdaCycleAtMillis = 0L
         nextHeartRateCycleAtMillis = 0L
         skinTempCycleActive = false
         edaCycleActive = false
         heartRateCycleActive = false
+        updateTrackingUiFlags()
         edaValidWindowStartedAtMillis = null
         heartRateValidWindowStartedAtMillis = null
         clearHeartRateStableSamples()
@@ -428,9 +540,13 @@ class ContinuousTrackingManager @Inject constructor(
 
     fun onWearStateChanged(isWorn: Boolean) {
         val changedAtMillis = System.currentTimeMillis()
+        val powerSnapshot = _dataState.value.powerStatusSnapshot
         _dataState.value = _dataState.value.copy(
             wearStatusSnapshot = WearStatusSnapshot(
                 isWorn = isWorn,
+                isCharging = powerSnapshot?.isCharging,
+                chargeSource = powerSnapshot?.chargeSource,
+                batteryLevelPercent = powerSnapshot?.batteryLevelPercent,
                 changedAtMillis = changedAtMillis
             )
         )
@@ -456,6 +572,43 @@ class ContinuousTrackingManager @Inject constructor(
         }
     }
 
+    fun onPowerStateChanged(
+        isCharging: Boolean,
+        chargeSource: String,
+        batteryLevelPercent: Int?
+    ) {
+        val changedAtMillis = System.currentTimeMillis()
+        val currentWearSnapshot = _dataState.value.wearStatusSnapshot
+        _dataState.value = _dataState.value.copy(
+            powerStatusSnapshot = PowerStatusSnapshot(
+                isCharging = isCharging,
+                chargeSource = chargeSource,
+                batteryLevelPercent = batteryLevelPercent,
+                changedAtMillis = changedAtMillis
+            ),
+            wearStatusSnapshot = currentWearSnapshot?.copy(
+                isCharging = isCharging,
+                chargeSource = chargeSource,
+                batteryLevelPercent = batteryLevelPercent,
+                changedAtMillis = changedAtMillis
+            )
+        )
+
+        scope.launch {
+            try {
+                uploadPowerStatus(
+                    isCharging = isCharging,
+                    chargeSource = chargeSource,
+                    batteryLevelPercent = batteryLevelPercent,
+                    changedAtMillis = changedAtMillis,
+                    isWorn = currentWearSnapshot?.isWorn
+                )
+            } catch (exception: Exception) {
+                Log.w(APP_TAG, "Failed to upload power status", exception)
+            }
+        }
+    }
+
     fun updateUploadTarget(host: String, port: Int) {
         val normalizedHost = host.trim().ifEmpty { defaultUploadHost }
         val normalizedPort = port.coerceIn(1, 65535)
@@ -467,6 +620,199 @@ class ContinuousTrackingManager @Inject constructor(
             uploadHost = normalizedHost,
             uploadPort = normalizedPort
         )
+    }
+
+    fun toggleEcgMeasurement() {
+        if (_dataState.value.ecgMeasurementRunning) {
+            scope.launch {
+                finishEcgMeasurement(success = false, errorMessage = "Cancelled")
+            }
+            return
+        }
+
+        if (!ecgSupported) {
+            scope.launch {
+                _messageState.emit(ContinuousTrackingMessageState.Error("ECG tracker is not supported"))
+            }
+            return
+        }
+
+        if (_connectionState.value != ContinuousConnectionState.Connected) {
+            scope.launch {
+                _messageState.emit(ContinuousTrackingMessageState.Error("Health Tracking Service is not connected"))
+            }
+            return
+        }
+
+        if (skinTempCycleActive || heartRateCycleActive || edaCycleActive) {
+            scope.launch {
+                _messageState.emit(ContinuousTrackingMessageState.Error("HR/TEMP/EDA 活动中，暂时不能开始 ECG"))
+            }
+            return
+        }
+
+        if (!isEcgReadyToStart()) {
+            scope.launch {
+                _messageState.emit(ContinuousTrackingMessageState.Error("请等待 HR/TEMP/EDA 本轮全部完成后再开始 ECG"))
+            }
+            return
+        }
+
+        startEcgMeasurement()
+    }
+
+    private fun startEcgMeasurement() {
+        val tracker = sharedServiceManager.getHealthTracker(HealthTrackerType.ECG_ON_DEMAND)
+        if (tracker == null) {
+            scope.launch {
+                _messageState.emit(ContinuousTrackingMessageState.Error("ECG tracker is not initialized"))
+            }
+            return
+        }
+
+        pauseContinuousTrackingForEcg()
+        clearEcgSamples()
+        ecgTracker = tracker
+        _dataState.value = _dataState.value.copy(
+            ecgMeasurementRunning = true,
+            ecgLeadOff = true,
+            ecgRemainingSeconds = (ecgMeasurementDurationMillis / 1000L).toInt(),
+            ecgCurrentValueMv = null,
+            ecgStatusText = "Measuring ECG"
+        )
+
+        try {
+            ecgTracker?.setEventListener(ecgTrackerListener)
+        } catch (exception: Exception) {
+            stopEcgTracker()
+            _dataState.value = _dataState.value.copy(
+                ecgMeasurementRunning = false,
+                ecgStatusText = "ECG unavailable"
+            )
+            resumeContinuousTrackingAfterEcg()
+            scope.launch {
+                _messageState.emit(ContinuousTrackingMessageState.Error(exception.message))
+            }
+            return
+        }
+
+        ecgMeasurementJob?.cancel()
+        ecgMeasurementJob = scope.launch {
+            val startedAt = System.currentTimeMillis()
+            while (true) {
+                val elapsed = System.currentTimeMillis() - startedAt
+                val remainingSeconds = ((ecgMeasurementDurationMillis - elapsed).coerceAtLeast(0L) / 1000L).toInt()
+                if (!_dataState.value.ecgMeasurementRunning) {
+                    return@launch
+                }
+                _dataState.value = _dataState.value.copy(ecgRemainingSeconds = remainingSeconds)
+                if (elapsed >= ecgMeasurementDurationMillis) {
+                    break
+                }
+                delay(ecgMeasurementTickMillis)
+            }
+            finishEcgMeasurement(success = true, errorMessage = null)
+        }
+    }
+
+    private fun pauseContinuousTrackingForEcg() {
+        resumeContinuousTrackingAfterEcg = _progressState.value == ContinuousTrackingProgressState.Tracking
+        if (!resumeContinuousTrackingAfterEcg) {
+            return
+        }
+
+        cancelSensorLoops()
+        stopAllTrackers()
+        skinTempCycleActive = false
+        edaCycleActive = false
+        heartRateCycleActive = false
+        edaValidWindowStartedAtMillis = null
+        heartRateValidWindowStartedAtMillis = null
+        clearHeartRateStableSamples()
+        clearSkinTempSamples()
+        updateTrackingUiFlags()
+    }
+
+    private fun resumeContinuousTrackingAfterEcg() {
+        if (!resumeContinuousTrackingAfterEcg) {
+            return
+        }
+
+        val availableTrackers = sharedServiceManager.getSupportedTrackers().orEmpty()
+        resetPrimarySensorCompletionState()
+        val now = System.currentTimeMillis()
+        nextSkinTempCycleAtMillis = now
+        nextEdaCycleAtMillis = now
+        nextHeartRateCycleAtMillis = now
+
+        if (availableTrackers.contains(HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS) && skinTempLoopJob == null) {
+            skinTempLoopJob = scope.launch { runSkinTempLoop() }
+        }
+        if (availableTrackers.contains(HealthTrackerType.HEART_RATE_CONTINUOUS) && heartRateLoopJob == null) {
+            heartRateLoopJob = scope.launch { runHeartRateLoop() }
+        }
+        if (availableTrackers.contains(HealthTrackerType.EDA_CONTINUOUS) && hasTrackingOwnership && edaLoopJob == null) {
+            edaLoopJob = scope.launch { runEdaLoop() }
+        }
+
+        resumeContinuousTrackingAfterEcg = false
+        updateTrackingUiFlags()
+    }
+
+    private suspend fun finishEcgMeasurement(success: Boolean, errorMessage: String?) {
+        val currentJob = currentCoroutineContext()[Job]
+        if (ecgMeasurementJob != null && ecgMeasurementJob !== currentJob) {
+            ecgMeasurementJob?.cancel()
+        }
+        ecgMeasurementJob = null
+        stopEcgTracker()
+
+        val samples = snapshotEcgSamples()
+        val latestValue = samples.lastOrNull()?.valueMv
+        val leadOff = _dataState.value.ecgLeadOff
+        val canUpload = success && !leadOff && samples.isNotEmpty()
+        var statusText = when {
+            errorMessage == "Cancelled" -> "ECG cancelled"
+            !success -> "ECG failed"
+            leadOff -> "Measurement failed"
+            else -> latestValue?.let { String.format(Locale.getDefault(), "Done %.2f mV", it) } ?: "Measurement successful"
+        }
+
+        if (canUpload) {
+            val payload = buildEcgPayload(samples)
+            try {
+                uploadPayloadNow(payload)
+                val uploadedAtMillis = payload.getLong("timestamp")
+                statusText = latestValue?.let {
+                    String.format(Locale.getDefault(), "Sent %.2f mV", it)
+                } ?: "ECG sent"
+                _dataState.value = _dataState.value.copy(
+                    lastUploadedSnapshot = UploadedSnapshot(
+                        uploadedAtMillis = uploadedAtMillis,
+                        sensorType = "ECG",
+                        primaryText = "${samples.size} samples",
+                        secondaryText = latestValue?.let { String.format(Locale.getDefault(), "%.2f mV", it) }
+                    )
+                )
+            } catch (exception: Exception) {
+                enqueuePendingUpload(sensorName = "ECG", payload = payload)
+                handleUploadFailure("ECG", exception)
+                statusText = "ECG saved for retry"
+            }
+        }
+
+        _dataState.value = _dataState.value.copy(
+            ecgMeasurementRunning = false,
+            ecgRemainingSeconds = null,
+            ecgStatusText = statusText,
+            ecgCurrentValueMv = latestValue,
+            lastEcgValueMv = latestValue,
+            lastEcgMeasuredAtMillis = if (canUpload || success) System.currentTimeMillis() else _dataState.value.lastEcgMeasuredAtMillis,
+            lastEcgSampleCount = samples.size
+        )
+
+        clearEcgSamples()
+        resumeContinuousTrackingAfterEcg()
     }
 
     fun reconnect() {
@@ -530,11 +876,14 @@ class ContinuousTrackingManager @Inject constructor(
 
     private fun checkTrackerAvailability() {
         val availableTrackers = sharedServiceManager.getSupportedTrackers()
+        updateSupportedPrimaryTrackers(availableTrackers.orEmpty())
         val edaSupported = availableTrackers?.contains(HealthTrackerType.EDA_CONTINUOUS) == true
         val skinTempSupported = availableTrackers?.contains(HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS) == true
         val heartRateSupported = availableTrackers?.contains(HealthTrackerType.HEART_RATE_CONTINUOUS) == true
         val ppgSupported = availableTrackers?.contains(HealthTrackerType.PPG_CONTINUOUS) == true
+        ecgSupported = availableTrackers?.contains(HealthTrackerType.ECG_ON_DEMAND) == true
         val hasPrimarySensorSupported = edaSupported || skinTempSupported || heartRateSupported
+        updateTrackingUiFlags()
 
         if (!hasPrimarySensorSupported) {
             _progressState.value = ContinuousTrackingProgressState.TrackingDisabled
@@ -565,6 +914,7 @@ class ContinuousTrackingManager @Inject constructor(
                 }
 
                 skinTempCycleActive = true
+                updateTrackingUiFlags()
                 skinTempAcquisitionStartedAtMillis = now
                 lastFlushAtMillis = 0L
                 Log.i(APP_TAG, "Start scheduled TEMP acquisition")
@@ -596,6 +946,7 @@ class ContinuousTrackingManager @Inject constructor(
                 }
 
                 heartRateCycleActive = true
+                updateTrackingUiFlags()
                 heartRateAcquisitionStartedAtMillis = now
                 heartRateValidWindowStartedAtMillis = null
                 clearHeartRateStableSamples()
@@ -638,6 +989,7 @@ class ContinuousTrackingManager @Inject constructor(
                 }
 
                 edaCycleActive = true
+                updateTrackingUiFlags()
                 edaValidWindowStartedAtMillis = null
                 edaAcquisitionStartedAtMillis = null
                 lastFlushAtMillis = 0L
@@ -702,7 +1054,9 @@ class ContinuousTrackingManager @Inject constructor(
             )
         }
         uploadTemperatureValue(value)
+        skinTempCompletedForCurrentRun = true
         skinTempCycleActive = false
+        updateTrackingUiFlags()
         nextSkinTempCycleAtMillis = now + tempSamplingIntervalMillis
         clearSkinTempSamples()
         stopSkinTempTracker()
@@ -748,24 +1102,32 @@ class ContinuousTrackingManager @Inject constructor(
 
         if (stableHeartRate != null) {
             heartRateUploadMutex.withLock {
-                val uploadedAtMillis = uploadHeartRateValueNow(stableHeartRate)
-                _dataState.value = _dataState.value.copy(
-                    heartRateValue = stableHeartRate,
-                    liveHeartRateValue = stableHeartRate,
-                    lastHeartRateUpdateAtMillis = now,
-                    lastUploadedSnapshot = UploadedSnapshot(
-                        uploadedAtMillis = uploadedAtMillis,
-                        sensorType = "HR",
-                        primaryText = "${stableHeartRate.heartRate ?: 0} bpm",
-                        secondaryText = "stable 10s"
+                val payload = buildHeartRatePayload(stableHeartRate)
+                try {
+                    uploadPayloadNow(payload)
+                    val uploadedAtMillis = payload.getLong("timestamp")
+                    replayPendingUploads(trigger = "heart_rate_cycle")
+                    _dataState.value = _dataState.value.copy(
+                        heartRateValue = stableHeartRate,
+                        liveHeartRateValue = stableHeartRate,
+                        lastHeartRateUpdateAtMillis = now,
+                        lastUploadedSnapshot = UploadedSnapshot(
+                            uploadedAtMillis = uploadedAtMillis,
+                            sensorType = "HR",
+                            primaryText = "${stableHeartRate.heartRate ?: 0} bpm",
+                            secondaryText = "stable 10s"
+                        )
                     )
-                )
-                recordAcquisition(sensor = "HR", elapsedMillis = elapsedMillis)
-                _messageState.emit(
-                    ContinuousTrackingMessageState.Info(
-                        "HR获取稳定值 ${stableHeartRate.heartRate ?: 0} bpm，用时 ${formatElapsedDuration(elapsedMillis)}，已发送"
+                    recordAcquisition(sensor = "HR", elapsedMillis = elapsedMillis)
+                    _messageState.emit(
+                        ContinuousTrackingMessageState.Info(
+                            "HR获取稳定值 ${stableHeartRate.heartRate ?: 0} bpm，用时 ${formatElapsedDuration(elapsedMillis)}，已发送"
+                        )
                     )
-                )
+                } catch (exception: Exception) {
+                    enqueuePendingUpload(sensorName = "心率", payload = payload)
+                    handleUploadFailure("心率", exception)
+                }
             }
         } else {
             _messageState.emit(
@@ -775,7 +1137,9 @@ class ContinuousTrackingManager @Inject constructor(
             )
         }
 
+        heartRateCompletedForCurrentRun = true
         heartRateCycleActive = false
+        updateTrackingUiFlags()
         nextHeartRateCycleAtMillis = now + heartRateSamplingIntervalMillis
         heartRateValidWindowStartedAtMillis = null
         clearHeartRateStableSamples()
@@ -783,7 +1147,9 @@ class ContinuousTrackingManager @Inject constructor(
     }
 
     private fun completeEdaCycle(now: Long) {
+        edaCompletedForCurrentRun = true
         edaCycleActive = false
+        updateTrackingUiFlags()
         nextEdaCycleAtMillis = now + edaSamplingIntervalMillis
         synchronized(edaSessionLock) {
             edaValidWindowStartedAtMillis = null
@@ -887,6 +1253,7 @@ class ContinuousTrackingManager @Inject constructor(
         stopEdaTracker()
         stopSkinTempTracker()
         stopHeartRateTracker()
+        stopEcgTracker()
         ppgTracker?.unsetEventListener()
         ppgTracker = null
     }
@@ -909,6 +1276,11 @@ class ContinuousTrackingManager @Inject constructor(
         heartRateAcquisitionStartedAtMillis = null
     }
 
+    private fun stopEcgTracker() {
+        ecgTracker?.unsetEventListener()
+        ecgTracker = null
+    }
+
     private fun appendSkinTempSample(sample: SkinTempValue) {
         val receivedAtMillis = System.currentTimeMillis()
         synchronized(skinTempSamplesLock) {
@@ -929,6 +1301,18 @@ class ContinuousTrackingManager @Inject constructor(
         }
     }
 
+    private fun clearEcgSamples() {
+        synchronized(ecgSamplesLock) {
+            ecgSamples.clear()
+        }
+    }
+
+    private fun snapshotEcgSamples(): List<EcgSample> {
+        return synchronized(ecgSamplesLock) {
+            ecgSamples.toList()
+        }
+    }
+
     private fun <T> trimExpiredSamples(
         samples: ArrayDeque<T>,
         nowMillis: Long,
@@ -944,14 +1328,10 @@ class ContinuousTrackingManager @Inject constructor(
             return
         }
         scope.launch {
+            val payload = buildTemperaturePayload(skinTempValue)
             try {
-                val uploadedAtMillis = uploadSensorPayload(sensorType = "temperature") { payload ->
-                    payload.put("temperature", JSONObject().apply {
-                        put("wristSkinTemperature", skinTempValue.wristSkinTemperature)
-                        put("ambientTemperature", skinTempValue.ambientTemperature)
-                        put("status", skinTempValue.status.name)
-                    })
-                }
+                uploadPayloadNow(payload)
+                val uploadedAtMillis = payload.getLong("timestamp")
                 _dataState.value = _dataState.value.copy(
                     lastUploadedSnapshot = UploadedSnapshot(
                         uploadedAtMillis = uploadedAtMillis,
@@ -963,6 +1343,7 @@ class ContinuousTrackingManager @Inject constructor(
                     )
                 )
             } catch (exception: Exception) {
+                enqueuePendingUpload(sensorName = "温度", payload = payload)
                 handleUploadFailure("温度", exception)
             }
         }
@@ -973,14 +1354,10 @@ class ContinuousTrackingManager @Inject constructor(
             return
         }
         scope.launch {
+            val payload = buildHeartRatePayload(heartRateValue)
             try {
-                val uploadedAtMillis = uploadSensorPayload(sensorType = "heart_rate") { payload ->
-                    payload.put("heartRate", JSONObject().apply {
-                        put("bpm", heartRateValue.heartRate)
-                        put("status", heartRateValue.status)
-                        put("sampleTimestamp", heartRateValue.timestamp)
-                    })
-                }
+                uploadPayloadNow(payload)
+                val uploadedAtMillis = payload.getLong("timestamp")
                 _dataState.value = _dataState.value.copy(
                     lastUploadedSnapshot = UploadedSnapshot(
                         uploadedAtMillis = uploadedAtMillis,
@@ -990,6 +1367,7 @@ class ContinuousTrackingManager @Inject constructor(
                     )
                 )
             } catch (exception: Exception) {
+                enqueuePendingUpload(sensorName = "心率", payload = payload)
                 handleUploadFailure("心率", exception)
             }
         }
@@ -1005,19 +1383,24 @@ class ContinuousTrackingManager @Inject constructor(
             val now = System.currentTimeMillis()
             val startedAtMillis = edaAcquisitionStartedAtMillis ?: now
             val elapsedMillis = (now - startedAtMillis).coerceAtLeast(0L)
+            val edaLabel = deriveEdaLabel(latestSample)
 
             _dataState.value = _dataState.value.copy(
                 edaValue = latestSample,
-                edaLabel = EdaWindowLabel.STABLE,
+                edaLabel = edaLabel,
                 edaValidSampleCount = samples.size,
                 lastEdaUpdateAtMillis = now
             )
             recordAcquisition(sensor = "EDA", elapsedMillis = elapsedMillis)
+            val payloads = samples.map { buildEdaPayload(it, edaLabel) }
+            var nextPendingIndex = 0
 
             try {
                 var uploadedAtMillis = now
-                samples.forEach { sample ->
-                    uploadedAtMillis = uploadEdaValue(sample)
+                payloads.forEachIndexed { index, payload ->
+                    uploadPayloadNow(payload)
+                    uploadedAtMillis = payload.getLong("timestamp")
+                    nextPendingIndex = index + 1
                 }
                 _dataState.value = _dataState.value.copy(
                     lastUploadedSnapshot = UploadedSnapshot(
@@ -1037,6 +1420,7 @@ class ContinuousTrackingManager @Inject constructor(
                     )
                 )
             } catch (exception: Exception) {
+                enqueuePendingUploads(sensorName = "EDA", payloads = payloads.drop(nextPendingIndex))
                 handleUploadFailure("EDA", exception)
             }
         }
@@ -1114,9 +1498,25 @@ class ContinuousTrackingManager @Inject constructor(
         return newSamples
     }
 
-    private suspend fun uploadHeartRateValueNow(heartRateValue: HeartRateValue): Long {
-        return uploadSensorPayload(sensorType = "heart_rate") { payload ->
-            payload.put("heartRate", JSONObject().apply {
+    private fun buildTemperaturePayload(skinTempValue: SkinTempValue): JSONObject {
+        val uploadedAtMillis = System.currentTimeMillis()
+        return JSONObject().apply {
+            put("timestamp", uploadedAtMillis)
+            put("sensorType", "temperature")
+            put("temperature", JSONObject().apply {
+                put("wristSkinTemperature", skinTempValue.wristSkinTemperature)
+                put("ambientTemperature", skinTempValue.ambientTemperature)
+                put("status", skinTempValue.status.name)
+            })
+        }
+    }
+
+    private fun buildHeartRatePayload(heartRateValue: HeartRateValue): JSONObject {
+        val uploadedAtMillis = System.currentTimeMillis()
+        return JSONObject().apply {
+            put("timestamp", uploadedAtMillis)
+            put("sensorType", "heart_rate")
+            put("heartRate", JSONObject().apply {
                 put("bpm", heartRateValue.heartRate)
                 put("status", heartRateValue.status)
                 put("sampleTimestamp", heartRateValue.timestamp)
@@ -1124,10 +1524,21 @@ class ContinuousTrackingManager @Inject constructor(
         }
     }
 
-    private suspend fun uploadEdaValue(edaValue: EDAValue): Long {
-        return uploadSensorPayload(sensorType = "eda") { payload ->
-            payload.put("eda", JSONObject().apply {
-                put("label", EdaWindowLabel.STABLE.name)
+    private fun deriveEdaLabel(edaValue: EDAValue): EdaWindowLabel {
+        return when (edaValue.status) {
+            EDAStatus.DETACHED -> EdaWindowLabel.DETACHED
+            EDAStatus.LOW_SIGNAL -> EdaWindowLabel.LOW_SIGNAL
+            else -> EdaWindowLabel.STABLE
+        }
+    }
+
+    private fun buildEdaPayload(edaValue: EDAValue, edaLabel: EdaWindowLabel): JSONObject {
+        val uploadedAtMillis = System.currentTimeMillis()
+        return JSONObject().apply {
+            put("timestamp", uploadedAtMillis)
+            put("sensorType", "eda")
+            put("eda", JSONObject().apply {
+                put("label", edaLabel.name)
                 put("validSampleCount", 1)
                 put("skinConductance", edaValue.skinConductance)
                 put("sampleTimestamp", edaValue.timestamp)
@@ -1135,23 +1546,74 @@ class ContinuousTrackingManager @Inject constructor(
         }
     }
 
-    private suspend fun uploadSensorPayload(
-        sensorType: String,
-        payloadBuilder: (JSONObject) -> Unit
-    ): Long = withContext(Dispatchers.IO) {
-        val uploadedAtMillis = System.currentTimeMillis()
-        val payload = JSONObject().apply {
-            put("timestamp", uploadedAtMillis)
-            put("sensorType", sensorType)
-            payloadBuilder(this)
+    private fun buildWearStatusPayload(
+        isWorn: Boolean,
+        changedAtMillis: Long
+    ): JSONObject {
+        val powerSnapshot = _dataState.value.powerStatusSnapshot
+        return JSONObject().apply {
+            put("timestamp", changedAtMillis)
+            put("event", "wear_state")
+            put("isWorn", isWorn)
+            put("state", if (isWorn) "WORN" else "UNWORN")
+            powerSnapshot?.let { power ->
+                put("isCharging", power.isCharging)
+                put("chargeSource", power.chargeSource)
+                power.batteryLevelPercent?.let { put("batteryLevelPercent", it) }
+            }
         }
+    }
 
+    private fun buildPowerStatusPayload(
+        isCharging: Boolean,
+        chargeSource: String,
+        batteryLevelPercent: Int?,
+        changedAtMillis: Long,
+        isWorn: Boolean?
+    ): JSONObject {
+        return JSONObject().apply {
+            put("timestamp", changedAtMillis)
+            put("event", "power_state")
+            put("isCharging", isCharging)
+            put("chargeSource", chargeSource)
+            put("state", if (isCharging) "CHARGING" else "ON_BATTERY")
+            if (isWorn != null) {
+                put("isWorn", isWorn)
+            }
+            batteryLevelPercent?.let { put("batteryLevelPercent", it) }
+        }
+    }
+
+    private fun buildEcgPayload(samples: List<EcgSample>): JSONObject {
+        val uploadedAtMillis = System.currentTimeMillis()
+        return JSONObject().apply {
+            put("timestamp", uploadedAtMillis)
+            put("sensorType", "ecg")
+            put("ecg", JSONObject().apply {
+                put("sampleCount", samples.size)
+                put("leadOff", false)
+                put("samples", JSONArray().apply {
+                    samples.forEach { sample ->
+                        put(
+                            JSONObject().apply {
+                                put("timestamp", sample.timestamp)
+                                put("mv", sample.valueMv)
+                            }
+                        )
+                    }
+                })
+            })
+        }
+    }
+
+    private suspend fun uploadPayloadNow(payload: JSONObject) = withContext(Dispatchers.IO) {
         val connection = (URL(buildUploadEndpoint()).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 10_000
             readTimeout = 10_000
             doOutput = true
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("x-watch-id", _dataState.value.watchId)
         }
 
         connection.outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
@@ -1164,44 +1626,156 @@ class ContinuousTrackingManager @Inject constructor(
         }
 
         connection.disconnect()
-        uploadedAtMillis
     }
 
     private suspend fun handleUploadFailure(sensorName: String, exception: Exception) {
         val errorDetail = exception.message?.takeIf { it.isNotBlank() } ?: exception.javaClass.simpleName
         Log.w(APP_TAG, "Failed to upload $sensorName payload to ${buildUploadEndpoint()}", exception)
-        _messageState.emit(ContinuousTrackingMessageState.Error("上传${sensorName}数据失败: $errorDetail"))
+        _messageState.emit(ContinuousTrackingMessageState.Error("上传${sensorName}数据失败，已加入补传队列: $errorDetail"))
     }
 
     private suspend fun uploadWearStatus(
         isWorn: Boolean,
         changedAtMillis: Long
-    ) = withContext(Dispatchers.IO) {
-        val payload = JSONObject().apply {
-            put("timestamp", changedAtMillis)
-            put("event", "wear_state")
-            put("isWorn", isWorn)
-            put("state", if (isWorn) "WORN" else "UNWORN")
+    ) {
+        val payload = buildWearStatusPayload(isWorn = isWorn, changedAtMillis = changedAtMillis)
+        try {
+            uploadPayloadNow(payload)
+        } catch (exception: Exception) {
+            enqueuePendingUpload(sensorName = "佩戴状态", payload = payload)
+            throw exception
+        }
+    }
+
+    private suspend fun uploadPowerStatus(
+        isCharging: Boolean,
+        chargeSource: String,
+        batteryLevelPercent: Int?,
+        changedAtMillis: Long,
+        isWorn: Boolean?
+    ) {
+        val payload = buildPowerStatusPayload(
+            isCharging = isCharging,
+            chargeSource = chargeSource,
+            batteryLevelPercent = batteryLevelPercent,
+            changedAtMillis = changedAtMillis,
+            isWorn = isWorn
+        )
+        try {
+            uploadPayloadNow(payload)
+        } catch (exception: Exception) {
+            enqueuePendingUpload(sensorName = "充电状态", payload = payload)
+            throw exception
+        }
+    }
+
+    private suspend fun enqueuePendingUpload(sensorName: String, payload: JSONObject) {
+        enqueuePendingUploads(sensorName = sensorName, payloads = listOf(payload))
+    }
+
+    private suspend fun enqueuePendingUploads(sensorName: String, payloads: List<JSONObject>) {
+        if (payloads.isEmpty()) {
+            return
         }
 
-        val connection = (URL(buildUploadEndpoint()).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 10_000
-            readTimeout = 10_000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        pendingUploadQueueMutex.withLock {
+            val queue = loadPendingUploadQueue().toMutableList()
+            payloads.forEach { payload ->
+                queue += PendingUploadRecord(
+                    sensorName = sensorName,
+                    payload = payload.toString(),
+                    enqueuedAtMillis = System.currentTimeMillis()
+                )
+            }
+            val trimmedQueue = if (queue.size > maxPendingUploadCount) {
+                queue.takeLast(maxPendingUploadCount)
+            } else {
+                queue
+            }
+            savePendingUploadQueue(trimmedQueue)
+            Log.w(APP_TAG, "Queued ${payloads.size} pending upload(s) for $sensorName; queueSize=${trimmedQueue.size}")
+        }
+    }
+
+    private suspend fun replayPendingUploads(trigger: String) {
+        var replayedCount = 0
+        pendingUploadQueueMutex.withLock {
+            val queue = loadPendingUploadQueue().toMutableList()
+            if (queue.isEmpty()) {
+                return
+            }
+
+            while (queue.isNotEmpty()) {
+                val next = queue.first()
+                try {
+                    uploadPayloadNow(JSONObject(next.payload))
+                    queue.removeAt(0)
+                    replayedCount += 1
+                } catch (exception: Exception) {
+                    savePendingUploadQueue(queue)
+                    Log.w(APP_TAG, "Replay stopped after $replayedCount item(s) on $trigger", exception)
+                    return
+                }
+            }
+
+            savePendingUploadQueue(queue)
         }
 
-        connection.outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
-            writer.write(payload.toString())
+        if (replayedCount > 0) {
+            Log.i(APP_TAG, "Replayed $replayedCount pending upload(s) after $trigger")
+            _messageState.emit(ContinuousTrackingMessageState.Info("网络恢复，已补传 $replayedCount 条待发送数据"))
+        }
+    }
+
+    private fun loadPendingUploadQueue(): List<PendingUploadRecord> {
+        val rawQueue = preferences.getString(pendingUploadQueueKey, null).orEmpty()
+        if (rawQueue.isBlank()) {
+            return emptyList()
         }
 
-        val responseCode = connection.responseCode
-        if (responseCode !in 200..299) {
-            throw IllegalStateException("Wear status upload failed with code $responseCode")
+        return try {
+            val jsonArray = JSONArray(rawQueue)
+            buildList(jsonArray.length()) {
+                for (index in 0 until jsonArray.length()) {
+                    val item = jsonArray.optJSONObject(index) ?: continue
+                    val sensorName = item.optString("sensorName")
+                    val payload = item.optString("payload")
+                    if (sensorName.isBlank() || payload.isBlank()) {
+                        continue
+                    }
+                    add(
+                        PendingUploadRecord(
+                            sensorName = sensorName,
+                            payload = payload,
+                            enqueuedAtMillis = item.optLong("enqueuedAtMillis")
+                        )
+                    )
+                }
+            }
+        } catch (exception: Exception) {
+            Log.w(APP_TAG, "Failed to parse pending upload queue; clearing it", exception)
+            preferences.edit().remove(pendingUploadQueueKey).apply()
+            emptyList()
+        }
+    }
+
+    private fun savePendingUploadQueue(queue: List<PendingUploadRecord>) {
+        if (queue.isEmpty()) {
+            preferences.edit().remove(pendingUploadQueueKey).apply()
+            return
         }
 
-        connection.disconnect()
+        val jsonArray = JSONArray()
+        queue.forEach { record ->
+            jsonArray.put(
+                JSONObject().apply {
+                    put("sensorName", record.sensorName)
+                    put("payload", record.payload)
+                    put("enqueuedAtMillis", record.enqueuedAtMillis)
+                }
+            )
+        }
+        preferences.edit().putString(pendingUploadQueueKey, jsonArray.toString()).apply()
     }
 
     private fun isValidEdaValue(value: EDAValue?): Boolean {
@@ -1287,17 +1861,27 @@ class ContinuousTrackingManager @Inject constructor(
     }
 
     private fun loadUploadHost(): String {
-        return preferences.getString("upload_host", defaultUploadHost)?.trim().orEmpty().ifEmpty { defaultUploadHost }
+        val storedHost = preferences.getString("upload_host", defaultUploadHost)?.trim().orEmpty()
+        if (storedHost == legacyUploadHost) {
+            preferences.edit().putString("upload_host", defaultUploadHost).apply()
+            return defaultUploadHost
+        }
+        return storedHost.ifEmpty { defaultUploadHost }
     }
 
     private fun loadUploadPort(): Int {
         val storedPort = preferences.getInt("upload_port", defaultUploadPort)
+        if (storedPort == legacyUploadPort || storedPort == 5000) {
+            // Clear stale cached port and use current default
+            preferences.edit().putInt("upload_port", defaultUploadPort).apply()
+            return defaultUploadPort
+        }
         return storedPort.coerceIn(1, 65535)
     }
 
     private fun buildUploadEndpoint(): String {
         val snapshot = _dataState.value
-        return "http://${snapshot.uploadHost}:${snapshot.uploadPort}/"
+        return "http://${snapshot.uploadHost}:${snapshot.uploadPort}/api/samsung-watch"
     }
 
     private fun recordAcquisition(sensor: String, elapsedMillis: Long) {
@@ -1315,6 +1899,17 @@ class ContinuousTrackingManager @Inject constructor(
     private data class TimestampedSkinTempSample(
         val sample: SkinTempValue,
         val receivedAtMillis: Long
+    )
+
+    private data class EcgSample(
+        val timestamp: Long,
+        val valueMv: Float
+    )
+
+    private data class PendingUploadRecord(
+        val sensorName: String,
+        val payload: String,
+        val enqueuedAtMillis: Long
     )
 
 }

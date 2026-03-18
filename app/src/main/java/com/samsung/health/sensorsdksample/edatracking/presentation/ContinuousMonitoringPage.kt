@@ -12,11 +12,14 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -24,11 +27,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.Surface
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -41,23 +45,53 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Devices
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.material.Text
 import com.samsung.health.sensorsdksample.edatracking.R
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousConnectionState
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingMessageState
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingProgressState
 import com.samsung.health.sensorsdksample.edatracking.data.EdaWindowLabel
+import com.samsung.health.sensorsdksample.edatracking.data.HeartRateValue
 import com.samsung.health.sensorsdksample.edatracking.data.SkinTempStatus
-import com.samsung.health.sensorsdksample.edatracking.data.UploadedSnapshot
+import com.samsung.health.sensorsdksample.edatracking.data.SkinTempValue
 import com.samsung.health.sensorsdksample.edatracking.data.WearStatusSnapshot
 import com.samsung.health.sensorsdksample.edatracking.presentation.theme.AppTypography
-import com.samsung.health.sensorsdksample.edatracking.presentation.theme.PaddingMedium
-import com.samsung.health.sensorsdksample.edatracking.presentation.theme.SpacerMedium
+import com.samsung.health.sensorsdksample.edatracking.presentation.theme.EDATrackingTheme
 import com.samsung.health.sensorsdksample.edatracking.viewModel.ContinuousTrackingViewModel
+import java.util.Calendar
 import java.util.Locale
+
+private data class ContinuousMonitoringUiState(
+    val connectionState: ContinuousConnectionState,
+    val progressState: ContinuousTrackingProgressState,
+    val wearStatusSnapshot: WearStatusSnapshot?,
+    val edaLabel: EdaWindowLabel?,
+    val lastEdaUpdateAtMillis: Long?,
+    val skinTempValue: SkinTempValue?,
+    val lastSkinTempUpdateAtMillis: Long?,
+    val heartRateValue: HeartRateValue?,
+    val lastHeartRateUpdateAtMillis: Long?,
+    val uploadHost: String,
+    val uploadPort: Int,
+    val ecgSupported: Boolean,
+    val isAnySensorCycleActive: Boolean,
+    val isEcgReadyToStart: Boolean,
+    val ecgMeasurementRunning: Boolean,
+    val ecgLeadOff: Boolean,
+    val ecgRemainingSeconds: Int?,
+    val ecgCurrentValueMv: Float?,
+    val ecgStatusText: String,
+    val lastEcgMeasuredAtMillis: Long?,
+    val lastEcgValueMv: Float?,
+    val lastEcgSampleCount: Int
+)
 
 @Composable
 fun ContinuousMonitoringPage(
@@ -69,7 +103,6 @@ fun ContinuousMonitoringPage(
     val dataState by viewModel.dataState.collectAsState()
     val progressState by viewModel.progressState.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
-    val wearStatusSnapshot = dataState.wearStatusSnapshot
     var showSettingsPrompt by remember { mutableStateOf(false) }
     var showUploadTargetDialog by remember { mutableStateOf(false) }
     var uploadHostInput by remember { mutableStateOf(dataState.uploadHost) }
@@ -84,7 +117,9 @@ fun ContinuousMonitoringPage(
         val granted = requiredContinuousPermissions().all { permission -> results[permission] == true }
         if (granted) {
             viewModel.startBackgroundTracking(context)
-        } else if (activity != null && requiredContinuousPermissions().all { permission ->
+        } else if (
+            activity != null &&
+            requiredContinuousPermissions().all { permission ->
                 !ActivityCompat.shouldShowRequestPermissionRationale(activity, permission)
             }
         ) {
@@ -129,14 +164,21 @@ fun ContinuousMonitoringPage(
                 }
 
                 is ContinuousTrackingMessageState.TrackingInUse -> {
-                    Toast.makeText(context, context.getString(R.string.continuous_eda_in_use), Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.continuous_eda_in_use),
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
             }
         }
     }
 
     LaunchedEffect(connectionState, progressState) {
-        if (progressState == ContinuousTrackingProgressState.Tracking || progressState == ContinuousTrackingProgressState.TrackingDisabled) {
+        if (
+            progressState == ContinuousTrackingProgressState.Tracking ||
+            progressState == ContinuousTrackingProgressState.TrackingDisabled
+        ) {
             return@LaunchedEffect
         }
 
@@ -233,216 +275,315 @@ fun ContinuousMonitoringPage(
         )
     }
 
-    val edaValue = dataState.edaValue
-    val skinTempValue = dataState.skinTempValue
-    val heartRateValue = dataState.heartRateValue
-    val liveHeartRateValue = dataState.liveHeartRateValue
-    val lastUploadedSnapshot = dataState.lastUploadedSnapshot
+    val uiState = ContinuousMonitoringUiState(
+        connectionState = connectionState,
+        progressState = progressState,
+        wearStatusSnapshot = dataState.wearStatusSnapshot,
+        edaLabel = dataState.edaLabel,
+        lastEdaUpdateAtMillis = dataState.lastEdaUpdateAtMillis,
+        skinTempValue = dataState.skinTempValue,
+        lastSkinTempUpdateAtMillis = dataState.lastSkinTempUpdateAtMillis,
+        heartRateValue = dataState.heartRateValue,
+        lastHeartRateUpdateAtMillis = dataState.lastHeartRateUpdateAtMillis,
+        uploadHost = dataState.uploadHost,
+        uploadPort = dataState.uploadPort,
+        ecgSupported = dataState.ecgSupported,
+        isAnySensorCycleActive = dataState.isAnySensorCycleActive,
+        isEcgReadyToStart = dataState.isEcgReadyToStart,
+        ecgMeasurementRunning = dataState.ecgMeasurementRunning,
+        ecgLeadOff = dataState.ecgLeadOff,
+        ecgRemainingSeconds = dataState.ecgRemainingSeconds,
+        ecgCurrentValueMv = dataState.ecgCurrentValueMv,
+        ecgStatusText = dataState.ecgStatusText,
+        lastEcgMeasuredAtMillis = dataState.lastEcgMeasuredAtMillis,
+        lastEcgValueMv = dataState.lastEcgValueMv,
+        lastEcgSampleCount = dataState.lastEcgSampleCount
+    )
 
+    ContinuousMonitoringContent(
+        uiState = uiState,
+        editTargetButtonLabel = stringResource(R.string.continuous_upload_target_edit),
+        onToggleEcgMeasurement = { viewModel.toggleEcgMeasurement() },
+        onEditTargetClick = {
+            uploadHostInput = dataState.uploadHost
+            uploadPortInput = dataState.uploadPort.toString()
+            showUploadTargetDialog = true
+        },
+        modifier = modifier
+    )
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ContinuousMonitoringContent(
+    uiState: ContinuousMonitoringUiState,
+    editTargetButtonLabel: String,
+    onToggleEcgMeasurement: () -> Unit,
+    onEditTargetClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val pagerState = rememberPagerState(pageCount = { 3 })
     val edaLines = listOf(
-        edaValue?.skinConductance?.let { String.format(Locale.getDefault(), "%.3f", it) } ?: "Waiting EDA",
-        dataState.edaLabel?.let { "Label ${it.name}" } ?: "Listening",
-        "Valid ${dataState.edaValidSampleCount} pts",
-        dataState.lastEdaUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No EDA update"
+        edaStatusLabel(uiState.progressState, uiState.edaLabel),
+        uiState.lastEdaUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No EDA update"
     )
-
-    val skinTempLines = listOf(
-        skinTempValue?.wristSkinTemperature?.let { String.format(Locale.getDefault(), "WS %.2f°C", it) } ?: "Waiting TEMP",
-        skinTempStatusLabel(skinTempValue?.status),
-        skinTempValue?.ambientTemperature?.let { String.format(Locale.getDefault(), "AT %.2f°C", it) } ?: "AT --",
-        dataState.lastSkinTempUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No TEMP update"
-    )
-
     val heartRateLines = listOf(
-        heartRateValue?.heartRate?.let { "$it bpm" } ?: "Waiting HR",
-        heartRateStatusLabel(heartRateValue?.status),
-        heartRateLiveLabel(liveHeartRateValue),
-        dataState.lastHeartRateUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No HR update"
+        uiState.heartRateValue?.heartRate?.let { "$it bpm" } ?: "Waiting HR",
+        uiState.lastHeartRateUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No HR update"
     )
-
-    val uploadLines = uploadSummaryLines(
-        snapshot = lastUploadedSnapshot,
-        emptyText = stringResource(R.string.null_value)
+    val skinTempLines = listOf(
+        uiState.skinTempValue?.wristSkinTemperature?.let { String.format(Locale.getDefault(), "WS %.2f°C", it) } ?: "WS --",
+        uiState.skinTempValue?.ambientTemperature?.let { String.format(Locale.getDefault(), "AT %.2f°C", it) } ?: "AT --",
+        uiState.lastSkinTempUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No TEMP update"
     )
-
-    val uploadTargetLines = listOf(
-        dataState.uploadHost,
-        "Port ${dataState.uploadPort}",
+    val targetLines = listOf(
+        uiState.uploadHost,
+        "Port ${uiState.uploadPort}",
         "HTTP POST /"
     )
 
-    val serviceLines = serviceStatusLines(
-        connectionState = connectionState,
-        progressState = progressState,
-        wearStatusSnapshot = wearStatusSnapshot
-    )
-
     Box(
-        modifier = modifier.fillMaxSize(),
-        contentAlignment = Alignment.TopCenter
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black)
     ) {
-        Column(
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize()
+        ) { page ->
+            when (page) {
+                0 -> PrimaryWearPage(
+                    uiState = uiState,
+                    edaLines = edaLines,
+                    heartRateLines = heartRateLines,
+                    skinTempLines = skinTempLines
+                )
+
+                1 -> EcgMeasurementPage(
+                    uiState = uiState,
+                    onToggleEcgMeasurement = onToggleEcgMeasurement
+                )
+
+                else -> PageFrame {
+                    EditableMetricBlock(
+                        title = "TARGET",
+                        lines = targetLines,
+                        buttonLabel = editTargetButtonLabel,
+                        onEditClick = onEditTargetClick,
+                        cardHeight = 132.dp,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        }
+
+        PageIndicatorRow(
+            currentPage = pagerState.currentPage,
+            pageCount = 3,
             modifier = Modifier
-                .fillMaxSize()
-                .padding(12.dp)
-                .verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 8.dp)
+        )
+    }
+}
+
+@Composable
+private fun PrimaryWearPage(
+    uiState: ContinuousMonitoringUiState,
+    edaLines: List<String>,
+    heartRateLines: List<String>,
+    skinTempLines: List<String>
+) {
+    ScalingLazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 12.dp),
+        contentPadding = PaddingValues(vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
+                horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 LabeledStatusIndicator(
-                    label = "HTS",
-                    active = connectionState == ContinuousConnectionState.Connected
-                )
-                LabeledStatusIndicator(
-                    label = "RUN",
-                    active = progressState == ContinuousTrackingProgressState.Tracking
-                )
-                LabeledStatusIndicator(
                     label = "WEAR",
-                    active = wearStatusSnapshot?.isWorn == true,
+                    active = uiState.wearStatusSnapshot?.isWorn == true,
                     inactiveColor = Color(0xFFE39B9B),
-                    unknown = wearStatusSnapshot == null
+                    unknown = uiState.wearStatusSnapshot == null
                 )
             }
-
-            ContinuousMetricBlock(
-                title = "SERVICE",
-                lines = serviceLines,
-                cardHeight = 110.dp,
-                modifier = Modifier.fillMaxWidth()
-            )
-
+        }
+        item {
             ContinuousMetricBlock(
                 title = "EDA",
                 lines = edaLines,
-                cardHeight = 110.dp,
+                cardHeight = 88.dp,
                 modifier = Modifier.fillMaxWidth()
             )
+        }
+        item {
             ContinuousMetricBlock(
                 title = "HR",
                 lines = heartRateLines,
-                cardHeight = 130.dp,
+                cardHeight = 88.dp,
                 modifier = Modifier.fillMaxWidth()
             )
+        }
+        item {
             ContinuousMetricBlock(
                 title = "TEMP",
                 lines = skinTempLines,
-                cardHeight = 120.dp,
-                modifier = Modifier.fillMaxWidth()
-            )
-            ContinuousMetricBlock(
-                title = "UPLOAD",
-                lines = uploadLines,
-                cardHeight = 145.dp,
-                modifier = Modifier.fillMaxWidth()
-            )
-            EditableMetricBlock(
-                title = "TARGET",
-                lines = uploadTargetLines,
-                buttonLabel = stringResource(R.string.continuous_upload_target_edit),
-                onEditClick = {
-                    uploadHostInput = dataState.uploadHost
-                    uploadPortInput = dataState.uploadPort.toString()
-                    showUploadTargetDialog = true
-                },
-                cardHeight = 132.dp,
+                cardHeight = 96.dp,
                 modifier = Modifier.fillMaxWidth()
             )
         }
     }
 }
 
-private fun edaApplicationLines(
-    label: EdaWindowLabel?,
-    validSampleCount: Int
-): List<String> {
-    return when (label) {
-        EdaWindowLabel.DETACHED -> listOf(
-            "Wear Check",
-            "Put the watch firmly on wrist",
-            "Waiting for valid EDA samples"
-        )
-
-        EdaWindowLabel.LOW_SIGNAL -> listOf(
-            "Contact Weak",
-            "Tighten the watch and keep still",
-            "Upload resumes on valid samples"
-        )
-
-        EdaWindowLabel.STABLE,
-        EdaWindowLabel.RISING,
-        EdaWindowLabel.RECOVERING,
-        EdaWindowLabel.VARIABLE -> listOf(
-            "Live Stream",
-            "Valid $validSampleCount pts",
-            "Upload each valid sample"
-        )
-
-        EdaWindowLabel.WAITING, null -> listOf(
-            "Listening",
-            "Valid $validSampleCount pts",
-            "Upload each valid sample"
-        )
-    }
-}
-
 @Composable
-private fun skinTempStatusLabel(status: SkinTempStatus?): String {
-    return when (status) {
-        SkinTempStatus.SUCCESSFUL_MEASUREMENT -> "Status SUCCESS"
-        SkinTempStatus.INVALID_MEASUREMENT -> "Status INVALID"
-        SkinTempStatus.UNKNOWN -> "Status UNKNOWN"
-        null -> "Status WAITING"
+private fun EcgMeasurementPage(
+    uiState: ContinuousMonitoringUiState,
+    onToggleEcgMeasurement: () -> Unit
+) {
+    val buttonEnabled = uiState.ecgMeasurementRunning || (
+        uiState.connectionState == ContinuousConnectionState.Connected &&
+            uiState.ecgSupported &&
+            uiState.isEcgReadyToStart
+        )
+    val statusLines = buildList {
+        add(uiState.ecgStatusText)
+        uiState.ecgRemainingSeconds?.let { add("${it}s remaining") }
+        uiState.ecgCurrentValueMv?.let { add(String.format(Locale.getDefault(), "%.2f mV", it)) }
+        if (uiState.ecgMeasurementRunning && uiState.ecgLeadOff) {
+            add("Keep finger on sensor")
+        }
+        uiState.lastEcgMeasuredAtMillis?.let { add("Last ${formatClockTime(it)}") }
+        if (uiState.lastEcgSampleCount > 0) {
+            add("${uiState.lastEcgSampleCount} samples")
+        }
+    }
+    val helperText = when {
+        !uiState.ecgSupported -> "ECG not supported"
+        uiState.connectionState != ContinuousConnectionState.Connected -> "HTS disconnected"
+        !uiState.isEcgReadyToStart && !uiState.ecgMeasurementRunning -> "Wait until HR/TEMP/EDA all finish"
+        uiState.ecgMeasurementRunning -> "Auto-send only after 30s ends\nManual stop will not send"
+        else -> "Press Start and hold finger for 30s"
+    }
+
+    PageFrame {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            ContinuousMetricBlock(
+                title = "ECG",
+                lines = if (statusLines.isEmpty()) listOf("Ready") else statusLines,
+                cardHeight = 104.dp,
+                modifier = Modifier.fillMaxWidth()
+            )
+            WearActionButton(
+                label = when {
+                    uiState.ecgMeasurementRunning -> "STOP ECG"
+                    buttonEnabled -> "START ECG"
+                    else -> "ECG LOCKED"
+                },
+                enabled = buttonEnabled,
+                onClick = onToggleEcgMeasurement
+            )
+            Text(
+                text = helperText,
+                style = AppTypography.bodySmall,
+                color = Color.White,
+                textAlign = TextAlign.Center
+            )
+        }
     }
 }
 
+@Preview(
+    name = "Wear Tracking",
+    device = Devices.WEAR_OS_SMALL_ROUND,
+    showSystemUi = true,
+    showBackground = true,
+    backgroundColor = 0xFF000000
+)
 @Composable
-private fun heartRateStatusLabel(status: Int?): String {
-    return status?.let { "Status $it" } ?: "Status WAITING"
-}
-
-private fun heartRateLiveLabel(value: com.samsung.health.sensorsdksample.edatracking.data.HeartRateValue?): String {
-    val heartRateText = value?.heartRate?.let { "$it bpm" } ?: "--"
-    val statusText = value?.status?.toString() ?: "--"
-    return "Live $heartRateText / S$statusText"
-}
-
-private fun uploadSummaryLines(
-    snapshot: UploadedSnapshot?,
-    emptyText: String
-): List<String> {
-    if (snapshot == null) {
-        return listOf(
-            "Last Send",
-            emptyText,
-            "Waiting for success",
-            ""
+private fun ContinuousMonitoringContentPreviewTracking() {
+    EDATrackingTheme {
+        ContinuousMonitoringContent(
+            uiState = previewUiState(),
+            editTargetButtonLabel = "Edit target",
+            onToggleEcgMeasurement = {},
+            onEditTargetClick = {}
         )
     }
+}
 
-    return listOf(
-        "At ${formatClockTime(snapshot.uploadedAtMillis)}",
-        snapshot.sensorType,
-        snapshot.primaryText,
-        snapshot.secondaryText.orEmpty()
-    )
+@Preview(
+    name = "Wear Idle",
+    device = Devices.WEAR_OS_SMALL_ROUND,
+    showSystemUi = true,
+    showBackground = true,
+    backgroundColor = 0xFF000000
+)
+@Composable
+private fun ContinuousMonitoringContentPreviewIdle() {
+    EDATrackingTheme {
+        ContinuousMonitoringContent(
+            uiState = previewUiState(
+                connectionState = ContinuousConnectionState.Connected,
+                progressState = ContinuousTrackingProgressState.Idle,
+                wearStatusSnapshot = null,
+                edaLabel = null,
+                lastEdaUpdateAtMillis = null,
+                skinTempValue = null,
+                lastSkinTempUpdateAtMillis = null,
+                heartRateValue = null,
+                lastHeartRateUpdateAtMillis = null,
+                ecgStatusText = "Ready"
+            ),
+            editTargetButtonLabel = "Edit target",
+            onToggleEcgMeasurement = {},
+            onEditTargetClick = {}
+        )
+    }
+}
+
+private fun edaStatusLabel(
+    progressState: ContinuousTrackingProgressState,
+    edaLabel: EdaWindowLabel?
+): String {
+    return when (progressState) {
+        ContinuousTrackingProgressState.Tracking -> when (edaLabel) {
+            EdaWindowLabel.DETACHED -> "Wear check"
+            EdaWindowLabel.LOW_SIGNAL -> "Low signal"
+            EdaWindowLabel.STABLE,
+            EdaWindowLabel.RISING,
+            EdaWindowLabel.RECOVERING,
+            EdaWindowLabel.VARIABLE -> "Running"
+            EdaWindowLabel.WAITING,
+            null -> "Listening"
+        }
+
+        ContinuousTrackingProgressState.Idle -> "Waiting"
+        ContinuousTrackingProgressState.TrackingDisabled -> "Disabled"
+    }
 }
 
 private fun formatClockTime(timeMillis: Long): String {
-    val calendar = java.util.Calendar.getInstance().apply {
+    val calendar = Calendar.getInstance().apply {
         timeInMillis = timeMillis
     }
     return String.format(
         Locale.getDefault(),
         "%02d:%02d:%02d",
-        calendar.get(java.util.Calendar.HOUR_OF_DAY),
-        calendar.get(java.util.Calendar.MINUTE),
-        calendar.get(java.util.Calendar.SECOND)
+        calendar.get(Calendar.HOUR_OF_DAY),
+        calendar.get(Calendar.MINUTE),
+        calendar.get(Calendar.SECOND)
     )
 }
 
@@ -464,8 +605,77 @@ private fun LabeledStatusIndicator(
         Text(
             text = label,
             style = AppTypography.bodySmall,
-            color = Color.Black,
+            color = Color.White,
             textAlign = TextAlign.Center
+        )
+    }
+}
+
+@Composable
+private fun PageFrame(
+    content: @Composable () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 12.dp, vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        content()
+    }
+}
+
+@Composable
+private fun PageIndicatorRow(
+    currentPage: Int,
+    pageCount: Int,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        repeat(pageCount) { index ->
+            Box(
+                modifier = Modifier
+                    .size(if (index == currentPage) 8.dp else 6.dp)
+                    .background(
+                        color = if (index == currentPage) Color.White else Color(0xFF5C5C5C),
+                        shape = CircleShape
+                    )
+            )
+        }
+    }
+}
+
+@Composable
+private fun WearActionButton(
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    val shape = RoundedCornerShape(999.dp)
+    val backgroundColor = if (enabled) Color(0xFFEBF7D9) else Color(0xFF2A2A2A)
+    val borderColor = if (enabled) Color(0xFF5E8E2E) else Color(0xFF6E6E6E)
+    val textColor = if (enabled) Color(0xFF183A00) else Color(0xFFCCCCCC)
+    Box(
+        modifier = Modifier
+            .widthIn(min = 118.dp)
+            .border(width = 2.dp, color = borderColor, shape = shape)
+            .background(
+                color = backgroundColor,
+                shape = shape
+            )
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 10.dp)
+    ) {
+        Text(
+            text = label,
+            style = AppTypography.bodySmall,
+            textAlign = TextAlign.Center,
+            color = textColor
         )
     }
 }
@@ -474,13 +684,16 @@ private fun LabeledStatusIndicator(
 private fun ContinuousMetricBlock(
     title: String,
     lines: List<String>,
-    cardHeight: androidx.compose.ui.unit.Dp,
+    cardHeight: Dp,
     modifier: Modifier = Modifier
 ) {
-    Surface(
-        modifier = modifier.height(cardHeight),
-        color = Color(0xFFF3F3F3),
-        shape = RoundedCornerShape(20.dp)
+    Box(
+        modifier = modifier
+            .height(cardHeight)
+            .background(
+                color = Color(0xFFF3F3F3),
+                shape = RoundedCornerShape(20.dp)
+            )
     ) {
         Column(
             modifier = Modifier
@@ -517,13 +730,16 @@ private fun EditableMetricBlock(
     lines: List<String>,
     buttonLabel: String,
     onEditClick: () -> Unit,
-    cardHeight: androidx.compose.ui.unit.Dp,
+    cardHeight: Dp,
     modifier: Modifier = Modifier
 ) {
-    Surface(
-        modifier = modifier.height(cardHeight),
-        color = Color(0xFFF3F3F3),
-        shape = RoundedCornerShape(20.dp)
+    Box(
+        modifier = modifier
+            .height(cardHeight)
+            .background(
+                color = Color(0xFFF3F3F3),
+                shape = RoundedCornerShape(20.dp)
+            )
     ) {
         Column(
             modifier = Modifier
@@ -548,8 +764,26 @@ private fun EditableMetricBlock(
                 )
                 Spacer(modifier = Modifier.height(2.dp))
             }
-            androidx.compose.material3.TextButton(onClick = onEditClick) {
-                androidx.compose.material3.Text(text = buttonLabel)
+            Box(
+                modifier = Modifier
+                    .border(
+                        width = 2.dp,
+                        color = Color(0xFF3A5F8A),
+                        shape = RoundedCornerShape(999.dp)
+                    )
+                    .background(
+                        color = Color(0xFFDCEAF8),
+                        shape = RoundedCornerShape(999.dp)
+                    )
+                    .clickable(onClick = onEditClick)
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = buttonLabel,
+                    style = AppTypography.bodySmall,
+                    textAlign = TextAlign.Center,
+                    color = Color.Black
+                )
             }
         }
     }
@@ -560,13 +794,14 @@ private fun ContinuousStatusIndicator(
     active: Boolean,
     inactiveColor: Color = Color(0xFFE5E5E5)
 ) {
-    Surface(
-        color = if (active) Color(0xFFB8E6C2) else inactiveColor,
-        shape = CircleShape,
-        modifier = Modifier.size(10.dp)
-    ) {
-        Box(modifier = Modifier.fillMaxSize())
-    }
+    Box(
+        modifier = Modifier
+            .size(10.dp)
+            .background(
+                color = if (active) Color(0xFFB8E6C2) else inactiveColor,
+                shape = CircleShape
+            )
+    )
 }
 
 private fun requiredContinuousPermissions(): Array<String> {
@@ -646,26 +881,54 @@ private fun openAppSettings(context: Context) {
     context.startActivity(intent)
 }
 
-private fun serviceStatusLines(
-    connectionState: ContinuousConnectionState,
-    progressState: ContinuousTrackingProgressState,
-    wearStatusSnapshot: WearStatusSnapshot?
-): List<String> {
-    val connectionText = when (connectionState) {
-        ContinuousConnectionState.Connected -> "HTS Connected"
-        ContinuousConnectionState.Disconnected -> "HTS Disconnected"
-    }
-    val progressText = when (progressState) {
-        ContinuousTrackingProgressState.Tracking -> "Measuring"
-        ContinuousTrackingProgressState.Idle -> "Waiting"
-        ContinuousTrackingProgressState.TrackingDisabled -> "Disabled"
-    }
-    val wearText = when (wearStatusSnapshot?.isWorn) {
-        true -> "Wear On"
-        false -> "Wear Off"
-        null -> "Wear Unknown"
-    }
-    val changedAtText = wearStatusSnapshot?.let { "Since ${formatClockTime(it.changedAtMillis)}" } ?: "Waiting sensor"
-
-    return listOf(connectionText, progressText, wearText, changedAtText)
+private fun previewUiState(
+    connectionState: ContinuousConnectionState = ContinuousConnectionState.Connected,
+    progressState: ContinuousTrackingProgressState = ContinuousTrackingProgressState.Tracking,
+    wearStatusSnapshot: WearStatusSnapshot? = WearStatusSnapshot(isWorn = true, changedAtMillis = 1742288400000L),
+    edaLabel: EdaWindowLabel? = EdaWindowLabel.STABLE,
+    lastEdaUpdateAtMillis: Long? = 1742288400000L,
+    skinTempValue: SkinTempValue? = SkinTempValue(
+        ambientTemperature = 24.6f,
+        wristSkinTemperature = 32.4f,
+        status = SkinTempStatus.SUCCESSFUL_MEASUREMENT
+    ),
+    lastSkinTempUpdateAtMillis: Long? = 1742288400000L,
+    heartRateValue: HeartRateValue? = HeartRateValue(heartRate = 78, status = 1, timestamp = 1742288400000L),
+    lastHeartRateUpdateAtMillis: Long? = 1742288400000L,
+    ecgSupported: Boolean = true,
+    isAnySensorCycleActive: Boolean = false,
+    isEcgReadyToStart: Boolean = true,
+    ecgMeasurementRunning: Boolean = false,
+    ecgLeadOff: Boolean = false,
+    ecgRemainingSeconds: Int? = null,
+    ecgCurrentValueMv: Float? = null,
+    ecgStatusText: String = "Ready",
+    lastEcgMeasuredAtMillis: Long? = null,
+    lastEcgValueMv: Float? = null,
+    lastEcgSampleCount: Int = 0
+): ContinuousMonitoringUiState {
+    return ContinuousMonitoringUiState(
+        connectionState = connectionState,
+        progressState = progressState,
+        wearStatusSnapshot = wearStatusSnapshot,
+        edaLabel = edaLabel,
+        lastEdaUpdateAtMillis = lastEdaUpdateAtMillis,
+        skinTempValue = skinTempValue,
+        lastSkinTempUpdateAtMillis = lastSkinTempUpdateAtMillis,
+        heartRateValue = heartRateValue,
+        lastHeartRateUpdateAtMillis = lastHeartRateUpdateAtMillis,
+        uploadHost = "192.168.0.5",
+        uploadPort = 5000,
+        ecgSupported = ecgSupported,
+        isAnySensorCycleActive = isAnySensorCycleActive,
+        isEcgReadyToStart = isEcgReadyToStart,
+        ecgMeasurementRunning = ecgMeasurementRunning,
+        ecgLeadOff = ecgLeadOff,
+        ecgRemainingSeconds = ecgRemainingSeconds,
+        ecgCurrentValueMv = ecgCurrentValueMv,
+        ecgStatusText = ecgStatusText,
+        lastEcgMeasuredAtMillis = lastEcgMeasuredAtMillis,
+        lastEcgValueMv = lastEcgValueMv,
+        lastEcgSampleCount = lastEcgSampleCount
+    )
 }

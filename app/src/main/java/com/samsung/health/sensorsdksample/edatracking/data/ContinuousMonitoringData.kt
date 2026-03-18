@@ -15,7 +15,20 @@ data class ContinuousMonitoringData(
     val lastAcquisitionAtMillis: Long? = null,
     val lastUploadedSnapshot: UploadedSnapshot? = null,
     val wearStatusSnapshot: WearStatusSnapshot? = null,
-    val uploadHost: String = "192.168.0.8",
-    val uploadPort: Int = 8080,
-    val ppgValue: PpgValue? = null
+    val powerStatusSnapshot: PowerStatusSnapshot? = null,
+    val uploadHost: String = "192.168.0.5",
+    val uploadPort: Int = 3100,
+    val watchId: String = "real-watch-001",
+    val ppgValue: PpgValue? = null,
+    val ecgSupported: Boolean = false,
+    val isAnySensorCycleActive: Boolean = false,
+    val isEcgReadyToStart: Boolean = true,
+    val ecgMeasurementRunning: Boolean = false,
+    val ecgLeadOff: Boolean = true,
+    val ecgRemainingSeconds: Int? = null,
+    val ecgCurrentValueMv: Float? = null,
+    val ecgStatusText: String = "ECG ready",
+    val lastEcgMeasuredAtMillis: Long? = null,
+    val lastEcgValueMv: Float? = null,
+    val lastEcgSampleCount: Int = 0
 )

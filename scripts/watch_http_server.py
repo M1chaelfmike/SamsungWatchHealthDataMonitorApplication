@@ -9,10 +9,13 @@ from time import monotonic
 
 class WatchRequestHandler(BaseHTTPRequestHandler):
     server_version = "WatchHTTP/1.0"
+    accepted_post_paths = {"/watch/data", "/"}
 
     def _message_category(self, payload: dict) -> str:
         if payload.get("event") == "wear_state":
             return "wear"
+        if payload.get("event") == "power_state":
+            return "power"
 
         sensor_type = payload.get("sensorType")
         if sensor_type == "temperature":
@@ -21,6 +24,8 @@ class WatchRequestHandler(BaseHTTPRequestHandler):
             return "heart_rate"
         if sensor_type == "eda":
             return "eda"
+        if sensor_type == "ecg":
+            return "ecg"
 
         return "other"
 
@@ -33,9 +38,24 @@ class WatchRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        self._write_json(200, {"status": "ok", "message": "watch receiver is running"})
+        if self.path not in {"/", "/health", "/watch/data"}:
+            self._write_json(404, {"status": "error", "message": f"unknown path: {self.path}"})
+            return
+
+        self._write_json(
+            200,
+            {
+                "status": "ok",
+                "message": "watch receiver is running",
+                "acceptedPaths": sorted(self.accepted_post_paths),
+            },
+        )
 
     def do_POST(self) -> None:
+        if self.path not in self.accepted_post_paths:
+            self._write_json(404, {"status": "error", "message": f"unknown path: {self.path}"})
+            return
+
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length)
 
@@ -59,7 +79,7 @@ class WatchRequestHandler(BaseHTTPRequestHandler):
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         print(self._format_console_message(record), flush=True)
-        self._write_json(200, {"status": "ok"})
+        self._write_json(200, {"status": "ok", "path": self.path})
 
     def log_message(self, format: str, *args) -> None:
         return
@@ -74,7 +94,23 @@ class WatchRequestHandler(BaseHTTPRequestHandler):
 
         if payload.get("event") == "wear_state":
             state = payload.get("state", "UNKNOWN")
-            return f"[{timestamp}] [{delta_text}] wear {state} from {client}"
+            charge_state = payload.get("isCharging")
+            charge_source = payload.get("chargeSource", "-")
+            battery_level = payload.get("batteryLevelPercent", "-")
+            return (
+                f"[{timestamp}] [{delta_text}] wear {state} from {client} | "
+                f"charging={charge_state} source={charge_source} battery={battery_level}%"
+            )
+
+        if payload.get("event") == "power_state":
+            return (
+                f"[{timestamp}] [{delta_text}] power from {client} | "
+                f"state={payload.get('state', '-')} "
+                f"charging={payload.get('isCharging', '-')} "
+                f"source={payload.get('chargeSource', '-')} "
+                f"battery={payload.get('batteryLevelPercent', '-')}% "
+                f"worn={payload.get('isWorn', '-')}"
+            )
 
         sensor_type = payload.get("sensorType")
         if sensor_type == "temperature":
@@ -97,6 +133,18 @@ class WatchRequestHandler(BaseHTTPRequestHandler):
                 f"[{timestamp}] [{delta_text}] EDA from {client} | "
                 f"label={eda.get('label', '-')} conductance={eda.get('skinConductance', '-')} "
                 f"valid={eda.get('validSampleCount', '-')}"
+            )
+        if sensor_type == "ecg":
+            ecg = payload.get("ecg") or {}
+            samples = ecg.get("samples") or []
+            last_mv = "-"
+            if samples and isinstance(samples, list):
+                last_sample = samples[-1] or {}
+                last_mv = last_sample.get("mv", "-")
+            return (
+                f"[{timestamp}] [{delta_text}] ECG from {client} | "
+                f"samples={ecg.get('sampleCount', len(samples))} "
+                f"leadOff={ecg.get('leadOff', '-')} lastMv={last_mv}"
             )
 
         eda = payload.get("eda") or {}
@@ -131,14 +179,14 @@ class WatchHTTPServer(ThreadingHTTPServer):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Receive sensor payloads from the watch over HTTP.")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--output", default="received/watch_payloads.jsonl")
     args = parser.parse_args()
 
     server = WatchHTTPServer((args.host, args.port), WatchRequestHandler)
     server.output_file = Path(args.output)
 
-    print(f"Listening on http://{args.host}:{args.port}/", flush=True)
+    print(f"Listening on http://{args.host}:{args.port}/watch/data", flush=True)
     print(f"Writing payloads to {server.output_file.resolve()}", flush=True)
     try:
         server.serve_forever()
