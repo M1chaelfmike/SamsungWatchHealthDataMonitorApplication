@@ -82,7 +82,7 @@ class EDATrackingManager @Inject constructor(
                 if (exception.hasResolution()) {
                     _messageState.emit(MessageState.ResolvableError(exception))
                 } else {
-                    exception.printStackTrace()
+                    Log.w(APP_TAG, "Health Tracking Service connection failed", exception)
                     _messageState.emit(MessageState.Error(exception.message))
                 }
             }
@@ -151,11 +151,12 @@ class EDATrackingManager @Inject constructor(
             return
         }
         hasTrackingOwnership = true
-        edaTracker = obtainEDATracker()
+        val tracker = obtainEDATracker()
+        edaTracker = tracker
 
-        if (edaTracker != null) {
+        if (tracker != null) {
             try {
-                edaTracker!!.setEventListener(trackerListener)
+                tracker.setEventListener(trackerListener)
                 _progressState.value = ProgressState.Measuring(true)
             } catch (exception: IllegalStateException) {
                 trackerSessionCoordinator.releaseEda(TrackerOwner.PAGE1_EDA)
@@ -175,9 +176,7 @@ class EDATrackingManager @Inject constructor(
     }
 
     fun stopTracking() {
-        if (edaTracker != null) {
-            edaTracker!!.unsetEventListener()
-        }
+        edaTracker?.unsetEventListener()
         edaTracker = null
         _progressState.value = ProgressState.Measuring(false)
         if (hasTrackingOwnership) {
@@ -197,22 +196,20 @@ class EDATrackingManager @Inject constructor(
         }
     }
 
+    /**
+     * Returns the Samsung Health continuous EDA tracker when the shared service is connected.
+     */
     fun obtainEDATracker(): HealthTracker? {
-        var edaTracker: HealthTracker? = null
-
-        edaTracker = sharedServiceManager.getHealthTracker(HealthTrackerType.EDA_CONTINUOUS)
-
-        return edaTracker
+        return sharedServiceManager.getHealthTracker(HealthTrackerType.EDA_CONTINUOUS)
     }
 
+    /**
+     * Converts a raw Samsung Health data point into the app's EDA value model.
+     */
     fun extractEdaValues(dataPoint: DataPoint): EDAValue {
-        var skinConductance: Float? = null
-        var edaStatus: Int? = null
-        var edaTimestamp: Long? = null
-
-        skinConductance = dataPoint.getValue(ValueKey.EdaSet.SKIN_CONDUCTANCE)
-        edaStatus = dataPoint.getValue(ValueKey.EdaSet.STATUS)
-        edaTimestamp = dataPoint.timestamp
+        val skinConductance: Float? = dataPoint.getValue(ValueKey.EdaSet.SKIN_CONDUCTANCE)
+        val edaStatus: Int? = dataPoint.getValue(ValueKey.EdaSet.STATUS)
+        val edaTimestamp = dataPoint.timestamp
 
         return EDAValue(skinConductance, EDAStatus.fromInt(edaStatus), edaTimestamp)
     }

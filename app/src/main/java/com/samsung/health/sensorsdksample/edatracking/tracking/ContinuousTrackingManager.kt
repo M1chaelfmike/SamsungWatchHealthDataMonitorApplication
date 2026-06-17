@@ -7,6 +7,8 @@ import com.samsung.android.service.health.tracking.HealthTracker
 import com.samsung.android.service.health.tracking.data.DataPoint
 import com.samsung.android.service.health.tracking.data.HealthTrackerType
 import com.samsung.android.service.health.tracking.data.ValueKey
+import com.samsung.health.sensorsdksample.edatracking.config.WatchEndpoints
+import com.samsung.health.sensorsdksample.edatracking.config.WatchConfigStore
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousConnectionState
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousMonitoringData
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingMessageState
@@ -46,9 +48,16 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.abs
 
+/**
+ * Coordinates continuous sensor collection, alert evaluation, and backend upload.
+ *
+ * This class is intentionally stateful because Samsung Health tracker listeners and
+ * foreground-service recovery need to share one live session state.
+ */
 @Singleton
 class ContinuousTrackingManager @Inject constructor(
     @dagger.hilt.android.qualifiers.ApplicationContext private val context: Context,
+    private val watchConfigStore: WatchConfigStore,
     private val sharedServiceManager: SharedHealthTrackingServiceManager,
     private val trackerSessionCoordinator: TrackerSessionCoordinator
 ) {
@@ -56,8 +65,26 @@ class ContinuousTrackingManager @Inject constructor(
     private val tempSamplingIntervalMillis = 10 * 60 * 1000L
     private val edaSamplingIntervalMillis = 10 * 60 * 1000L
     private val edaSamplingDurationMillis = 30_000L
-    private val heartRateSamplingIntervalMillis = 5 * 60 * 1000L
+    private val edaArtifactThresholdUs = 5f
+    private val edaTrendMinimumSamples = 3
+    private val edaRisingDeltaThresholdUs = 0.15f
+    private val edaStableDeltaThresholdUs = 0.08f
+    private val edaStableRangeThresholdUs = 0.18f
+    private val edaVariableRangeThresholdUs = 0.35f
     private val heartRateStabilizationDurationMillis = 10_000L
+    private val heartRateWarningThresholdBpm = 120
+    private val heartRateCriticalThresholdBpm = 140
+    private val heartRateRecoveryThresholdBpm = 110
+    private val heartRateWarningConfirmationMillis = 10_000L
+    private val heartRateCriticalConfirmationMillis = 10_000L
+    private val heartRateRecoveryConfirmationMillis = 60_000L
+    private val heartRateAlertEvaluationWindowMillis = 10_000L
+    private val heartRateAlertRealtimeAggregationWindowMillis = 5_000L
+    private val heartRateAlertRetentionMillis = 60_000L
+    private val heartRateWarningUploadIntervalMillis = 5_000L
+    private val heartRateCriticalUploadIntervalMillis = 2_000L
+    private val heartRateImmediateUploadDeltaBpm = 5
+    private val heartRateAlertMinimumSampleCount = 3
     private val ecgMeasurementDurationMillis = 30_000L
     private val ecgMeasurementTickMillis = 1_000L
     private val ecgLeadOffNoContact = 5
@@ -69,13 +96,17 @@ class ContinuousTrackingManager @Inject constructor(
     private val edaRetryDelayMillis = 15_000L
     private val tempSignalStaleRecoveryMillis = 30_000L
     private val tempStaleRecoveryMillis = 45_000L
-    private val heartRateStaleRecoveryMillis = 120_000L
+    private val heartRateStaleRecoveryMinMillis = 120_000L
+    private val heartRateStaleRecoveryBufferMillis = 60_000L
     private val edaStaleRecoveryMillis = 30_000L
     private val noDataStartupRecoveryMillis = 45_000L
 
     private val samplePollIntervalMillis = 250L
     private val FLUSH_INTERVAL_MILLIS = 1_000L
     private val pendingUploadQueueKey = "pending_upload_queue_v1"
+    private val popupSuccessEnabledKey = "popup_success_enabled_v1"
+    private val popupFailureEnabledKey = "popup_failure_enabled_v1"
+    private val heartRateMonitoringModeKey = "heart_rate_monitoring_mode_v1"
     private val maxPendingUploadCount = 512
     private val preferences: SharedPreferences = context.getSharedPreferences("continuous_tracking", Context.MODE_PRIVATE)
     private var isPausedForOffBody = false
@@ -113,6 +144,7 @@ class ContinuousTrackingManager @Inject constructor(
     private var heartRateCycleActive = false
     private var edaValidWindowStartedAtMillis: Long? = null
     private var heartRateValidWindowStartedAtMillis: Long? = null
+    private var currentEdaCycleValidSampleCount = 0
     private var lastValidSkinTempAtMillis: Long? = null
     private var lastSkinTempSignalAtMillis: Long? = null
     private var lastQueuedHeartRateTimestamp: Long? = null
@@ -129,14 +161,31 @@ class ContinuousTrackingManager @Inject constructor(
     private val edaSessionLock = Any()
     private val heartRateSessionLock = Any()
     private val heartRateStableSamples = ArrayDeque<HeartRateValue>()
+    private val heartRateRecentSamples = ArrayDeque<TimestampedHeartRateSample>()
+    private val heartRateRecentSamplesLock = Any()
+    private val heartRateAlertLock = Any()
     private val ecgSamples = ArrayDeque<EcgSample>()
+    private var heartRateAlertLevel = HeartRateAlertLevel.NORMAL
+    private var heartRateAlertEnteredAtMillis: Long? = null
+    private var heartRateWarningStartedAtMillis: Long? = null
+    private var heartRateCriticalStartedAtMillis: Long? = null
+    private var heartRateRecoveryStartedAtMillis: Long? = null
+    private var lastHeartRateAlertUploadAtMillis: Long? = null
+    private var lastUploadedHeartRateAlertBpm: Int? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val initialHeartRateMonitoringMode = loadHeartRateMonitoringMode()
+    private val initialWatchConfiguration = watchConfigStore.configuration.value
 
     private val _dataState = MutableStateFlow(
         ContinuousMonitoringData(
-            uploadHost = loadUploadHost(),
-            uploadPort = loadUploadPort()
+            uploadHost = initialWatchConfiguration.serverHost,
+            uploadPort = initialWatchConfiguration.serverPort,
+            showSuccessPopup = loadShowSuccessPopup(),
+            showFailurePopup = loadShowFailurePopup(),
+            heartRateMonitoringMode = initialHeartRateMonitoringMode.toUiValue(),
+            heartRateBaselineIntervalMinutes = initialHeartRateMonitoringMode.baselineIntervalMinutes,
+            watchId = initialWatchConfiguration.watchId
         )
     )
     val dataState = _dataState.asStateFlow()
@@ -165,6 +214,16 @@ class ContinuousTrackingManager @Inject constructor(
         }
 
         scope.launch {
+            watchConfigStore.configuration.collect { configuration ->
+                _dataState.value = _dataState.value.copy(
+                    uploadHost = configuration.serverHost,
+                    uploadPort = configuration.serverPort,
+                    watchId = configuration.watchId
+                )
+            }
+        }
+
+        scope.launch {
             sharedServiceManager.connectionErrors.collect { exception ->
                 if (exception.hasResolution()) {
                     _messageState.emit(ContinuousTrackingMessageState.ResolvableError(exception))
@@ -181,15 +240,17 @@ class ContinuousTrackingManager @Inject constructor(
                 return
             }
 
-            val validSamples = data
-                .map(::extractEdaValues)
-                .filter(::isValidEdaValue)
+            val samples = data.map(::extractEdaValues)
+            samples.lastOrNull()?.takeUnless(::isValidEdaValue)?.let(::updateEdaSignalState)
+
+            val validSamples = samples.filter(::isValidEdaValue)
 
             val newSamples = reserveNewEdaSamples(validSamples)
             if (newSamples.isNotEmpty()) {
                 startEdaCollectionWindowIfNeeded()
+                val countedSamples = assignEdaValidSampleCounts(newSamples)
                 scope.launch {
-                    processValidEdaSamples(newSamples)
+                    processValidEdaSamples(countedSamples)
                 }
             }
         }
@@ -264,6 +325,9 @@ class ContinuousTrackingManager @Inject constructor(
             val validSamples = reserveNewHeartRateSamples(samples.filter(::isValidHeartRateValue))
             if (validSamples.isNotEmpty()) {
                 bufferHeartRateSamples(validSamples)
+                appendHeartRateRecentSamples(validSamples)
+                val now = System.currentTimeMillis()
+                evaluateHeartRateAlertMonitoring(now)
             }
         }
 
@@ -479,6 +543,9 @@ class ContinuousTrackingManager @Inject constructor(
         edaValidWindowStartedAtMillis = null
         heartRateValidWindowStartedAtMillis = null
         clearHeartRateStableSamples()
+        resetHeartRateAlertMonitoringState()
+        updateHeartRateAlertUiState(System.currentTimeMillis())
+        currentEdaCycleValidSampleCount = 0
         lastQueuedEdaTimestamp = null
         lastQueuedHeartRateTimestamp = null
         _progressState.value = ContinuousTrackingProgressState.Tracking
@@ -509,14 +576,19 @@ class ContinuousTrackingManager @Inject constructor(
         skinTempCycleActive = false
         edaCycleActive = false
         heartRateCycleActive = false
+        currentEdaCycleValidSampleCount = 0
         updateTrackingUiFlags()
         edaValidWindowStartedAtMillis = null
         heartRateValidWindowStartedAtMillis = null
         clearHeartRateStableSamples()
+        resetHeartRateAlertMonitoringState()
         _dataState.value = _dataState.value.copy(
             liveHeartRateValue = null,
             heartRateValue = null,
             lastHeartRateUpdateAtMillis = null,
+            heartRateAlertLevel = HeartRateAlertLevel.NORMAL.toUiValue(),
+            heartRateRealtimeMonitoring = false,
+            heartRateAlertSustainedSeconds = 0,
             skinTempValue = null,
             lastSkinTempUpdateAtMillis = null,
             edaValue = null,
@@ -539,8 +611,34 @@ class ContinuousTrackingManager @Inject constructor(
     }
 
     fun onWearStateChanged(isWorn: Boolean) {
-        val changedAtMillis = System.currentTimeMillis()
+        handleWearStateUpdate(
+            isWorn = isWorn,
+            changedAtMillis = System.currentTimeMillis(),
+            controlTrackingState = true,
+            forceUpload = false,
+            reason = null
+        )
+    }
+
+    fun reportServiceStoppedAsNotWorn() {
+        handleWearStateUpdate(
+            isWorn = false,
+            changedAtMillis = System.currentTimeMillis(),
+            controlTrackingState = false,
+            forceUpload = true,
+            reason = "service_shutdown"
+        )
+    }
+
+    private fun handleWearStateUpdate(
+        isWorn: Boolean,
+        changedAtMillis: Long,
+        controlTrackingState: Boolean,
+        forceUpload: Boolean,
+        reason: String?
+    ) {
         val powerSnapshot = _dataState.value.powerStatusSnapshot
+        val previousSnapshot = _dataState.value.wearStatusSnapshot
         _dataState.value = _dataState.value.copy(
             wearStatusSnapshot = WearStatusSnapshot(
                 isWorn = isWorn,
@@ -551,12 +649,22 @@ class ContinuousTrackingManager @Inject constructor(
             )
         )
 
-        scope.launch {
-            try {
-                uploadWearStatus(isWorn = isWorn, changedAtMillis = changedAtMillis)
-            } catch (exception: Exception) {
-                Log.w(APP_TAG, "Failed to upload wear status", exception)
+        if (forceUpload || previousSnapshot?.isWorn != isWorn) {
+            scope.launch {
+                try {
+                    uploadWearStatus(
+                        isWorn = isWorn,
+                        changedAtMillis = changedAtMillis,
+                        reason = reason
+                    )
+                } catch (exception: Exception) {
+                    Log.w(APP_TAG, "Failed to upload wear status", exception)
+                }
             }
+        }
+
+        if (!controlTrackingState) {
+            return
         }
 
         if (isWorn) {
@@ -612,14 +720,49 @@ class ContinuousTrackingManager @Inject constructor(
     fun updateUploadTarget(host: String, port: Int) {
         val normalizedHost = host.trim().ifEmpty { defaultUploadHost }
         val normalizedPort = port.coerceIn(1, 65535)
-        preferences.edit()
-            .putString("upload_host", normalizedHost)
-            .putInt("upload_port", normalizedPort)
-            .apply()
+        val configuration = watchConfigStore.saveUploadTarget(normalizedHost, normalizedPort)
         _dataState.value = _dataState.value.copy(
-            uploadHost = normalizedHost,
-            uploadPort = normalizedPort
+            uploadHost = configuration.serverHost,
+            uploadPort = configuration.serverPort,
+            watchId = configuration.watchId
         )
+    }
+
+    fun updatePopupPreferences(showSuccessPopup: Boolean? = null, showFailurePopup: Boolean? = null) {
+        val currentState = _dataState.value
+        val updatedSuccessPopup = showSuccessPopup ?: currentState.showSuccessPopup
+        val updatedFailurePopup = showFailurePopup ?: currentState.showFailurePopup
+
+        preferences.edit()
+            .putBoolean(popupSuccessEnabledKey, updatedSuccessPopup)
+            .putBoolean(popupFailureEnabledKey, updatedFailurePopup)
+            .apply()
+
+        _dataState.value = currentState.copy(
+            showSuccessPopup = updatedSuccessPopup,
+            showFailurePopup = updatedFailurePopup
+        )
+    }
+
+    fun updateHeartRateMonitoringMode(mode: String) {
+        val updatedMode = HeartRateMonitoringMode.fromUiValue(mode)
+        val currentState = _dataState.value
+        if (currentState.heartRateMonitoringMode == updatedMode.toUiValue() &&
+            currentState.heartRateBaselineIntervalMinutes == updatedMode.baselineIntervalMinutes
+        ) {
+            return
+        }
+
+        preferences.edit()
+            .putString(heartRateMonitoringModeKey, updatedMode.toUiValue())
+            .apply()
+
+        _dataState.value = currentState.copy(
+            heartRateMonitoringMode = updatedMode.toUiValue(),
+            heartRateBaselineIntervalMinutes = updatedMode.baselineIntervalMinutes
+        )
+
+        rescheduleHeartRateBaselineForCurrentMode(System.currentTimeMillis())
     }
 
     fun toggleEcgMeasurement() {
@@ -726,6 +869,7 @@ class ContinuousTrackingManager @Inject constructor(
         skinTempCycleActive = false
         edaCycleActive = false
         heartRateCycleActive = false
+        currentEdaCycleValidSampleCount = 0
         edaValidWindowStartedAtMillis = null
         heartRateValidWindowStartedAtMillis = null
         clearHeartRateStableSamples()
@@ -860,7 +1004,7 @@ class ContinuousTrackingManager @Inject constructor(
         }
 
         snapshot.lastHeartRateUpdateAtMillis?.let { lastHeartRateAt ->
-            if (nowMillis - lastHeartRateAt >= heartRateStaleRecoveryMillis) {
+            if (nowMillis - lastHeartRateAt >= currentHeartRateStaleRecoveryMillis()) {
                 return "heart rate stalled for ${formatElapsedDuration(nowMillis - lastHeartRateAt)}"
             }
         }
@@ -964,13 +1108,18 @@ class ContinuousTrackingManager @Inject constructor(
                 lastFlushAtMillis = now
             }
 
-            val stableWindowStartedAt = synchronized(heartRateSessionLock) {
-                heartRateValidWindowStartedAtMillis
+            val alertMonitoringActive = synchronized(heartRateAlertLock) {
+                heartRateAlertLevel != HeartRateAlertLevel.NORMAL
             }
-            if (stableWindowStartedAt != null && now - stableWindowStartedAt >= heartRateStabilizationDurationMillis) {
-                val stableHeartRate = buildStableHeartRateValue(snapshotHeartRateStableSamples())
-                completeHeartRateCycle(stableHeartRate, now)
-                continue
+            if (!alertMonitoringActive) {
+                val stableWindowStartedAt = synchronized(heartRateSessionLock) {
+                    heartRateValidWindowStartedAtMillis
+                }
+                if (stableWindowStartedAt != null && now - stableWindowStartedAt >= heartRateStabilizationDurationMillis) {
+                    val stableHeartRate = buildStableHeartRateValue(snapshotHeartRateStableSamples())
+                    completeHeartRateCycle(stableHeartRate, now)
+                    continue
+                }
             }
 
             delay(samplePollIntervalMillis)
@@ -992,6 +1141,7 @@ class ContinuousTrackingManager @Inject constructor(
                 updateTrackingUiFlags()
                 edaValidWindowStartedAtMillis = null
                 edaAcquisitionStartedAtMillis = null
+                currentEdaCycleValidSampleCount = 0
                 lastFlushAtMillis = 0L
                 Log.i(APP_TAG, "Start scheduled EDA acquisition")
             }
@@ -1084,6 +1234,49 @@ class ContinuousTrackingManager @Inject constructor(
         }
     }
 
+    private fun appendHeartRateRecentSamples(samples: List<HeartRateValue>) {
+        if (samples.isEmpty()) {
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        synchronized(heartRateRecentSamplesLock) {
+            samples.forEach { sample ->
+                heartRateRecentSamples.addLast(
+                    TimestampedHeartRateSample(
+                        sample = sample,
+                        receivedAtMillis = sample.timestamp ?: now
+                    )
+                )
+            }
+            trimExpiredSamples(
+                samples = heartRateRecentSamples,
+                nowMillis = now,
+                retentionMillis = heartRateAlertRetentionMillis
+            ) { it.receivedAtMillis }
+        }
+    }
+
+    private fun snapshotHeartRateRecentSamples(windowMillis: Long): List<HeartRateValue> {
+        val now = System.currentTimeMillis()
+        return synchronized(heartRateRecentSamplesLock) {
+            trimExpiredSamples(
+                samples = heartRateRecentSamples,
+                nowMillis = now,
+                retentionMillis = heartRateAlertRetentionMillis
+            ) { it.receivedAtMillis }
+            heartRateRecentSamples
+                .filter { now - it.receivedAtMillis <= windowMillis }
+                .map { it.sample }
+        }
+    }
+
+    private fun clearHeartRateRecentSamples() {
+        synchronized(heartRateRecentSamplesLock) {
+            heartRateRecentSamples.clear()
+        }
+    }
+
     private fun snapshotHeartRateStableSamples(): List<HeartRateValue> {
         return synchronized(heartRateSessionLock) {
             heartRateStableSamples.toList()
@@ -1093,6 +1286,270 @@ class ContinuousTrackingManager @Inject constructor(
     private fun clearHeartRateStableSamples() {
         synchronized(heartRateSessionLock) {
             heartRateStableSamples.clear()
+        }
+    }
+
+    private fun resetHeartRateAlertMonitoringState() {
+        synchronized(heartRateAlertLock) {
+            heartRateAlertLevel = HeartRateAlertLevel.NORMAL
+            heartRateAlertEnteredAtMillis = null
+            heartRateWarningStartedAtMillis = null
+            heartRateCriticalStartedAtMillis = null
+            heartRateRecoveryStartedAtMillis = null
+            lastHeartRateAlertUploadAtMillis = null
+            lastUploadedHeartRateAlertBpm = null
+        }
+        clearHeartRateRecentSamples()
+    }
+
+    private fun updateHeartRateAlertUiState(now: Long) {
+        val (alertLevelText, realtimeMonitoring, sustainedSeconds) = synchronized(heartRateAlertLock) {
+            val sustainedSeconds = heartRateAlertEnteredAtMillis
+                ?.let { ((now - it).coerceAtLeast(0L) / 1000L).toInt() }
+                ?: 0
+            Triple(
+                heartRateAlertLevel.toUiValue(),
+                heartRateAlertLevel != HeartRateAlertLevel.NORMAL,
+                sustainedSeconds
+            )
+        }
+
+        val snapshot = _dataState.value
+        if (snapshot.heartRateAlertLevel == alertLevelText &&
+            snapshot.heartRateRealtimeMonitoring == realtimeMonitoring &&
+            snapshot.heartRateAlertSustainedSeconds == sustainedSeconds
+        ) {
+            return
+        }
+
+        _dataState.value = snapshot.copy(
+            heartRateAlertLevel = alertLevelText,
+            heartRateRealtimeMonitoring = realtimeMonitoring,
+            heartRateAlertSustainedSeconds = sustainedSeconds
+        )
+    }
+
+    private fun evaluateHeartRateAlertMonitoring(now: Long) {
+        val recentSamples = snapshotHeartRateRecentSamples(heartRateAlertEvaluationWindowMillis)
+        val recentHeartRates = recentSamples.mapNotNull { it.heartRate }
+        val enoughSamples = recentHeartRates.size >= heartRateAlertMinimumSampleCount
+        val recentMedianHeartRate = medianIntOrNull(recentHeartRates)
+        val warningCandidate = enoughSamples && (recentMedianHeartRate ?: 0) >= heartRateWarningThresholdBpm
+        val criticalCandidate = enoughSamples && (recentMedianHeartRate ?: 0) >= heartRateCriticalThresholdBpm
+
+        var statusMessage: String? = null
+        var forceRealtimeUpload = false
+        var exitRealtimeMonitoring = false
+
+        synchronized(heartRateAlertLock) {
+            if (warningCandidate) {
+                if (heartRateWarningStartedAtMillis == null) {
+                    heartRateWarningStartedAtMillis = now
+                }
+            } else {
+                heartRateWarningStartedAtMillis = null
+            }
+
+            if (criticalCandidate) {
+                if (heartRateCriticalStartedAtMillis == null) {
+                    heartRateCriticalStartedAtMillis = now
+                }
+            } else {
+                heartRateCriticalStartedAtMillis = null
+            }
+
+            if (heartRateAlertLevel == HeartRateAlertLevel.NORMAL) {
+                heartRateRecoveryStartedAtMillis = null
+                val warningConfirmed = heartRateWarningStartedAtMillis != null &&
+                    now - (heartRateWarningStartedAtMillis ?: now) >= heartRateWarningConfirmationMillis
+                val criticalConfirmed = heartRateCriticalStartedAtMillis != null &&
+                    now - (heartRateCriticalStartedAtMillis ?: now) >= heartRateCriticalConfirmationMillis
+
+                when {
+                    criticalConfirmed -> {
+                        heartRateAlertLevel = HeartRateAlertLevel.CRITICAL
+                        heartRateAlertEnteredAtMillis = now
+                        forceRealtimeUpload = true
+                        statusMessage = "心率持续过高，进入严重实时监测"
+                    }
+
+                    warningConfirmed -> {
+                        heartRateAlertLevel = HeartRateAlertLevel.WARNING
+                        heartRateAlertEnteredAtMillis = now
+                        forceRealtimeUpload = true
+                        statusMessage = "心率持续偏高，进入实时监测"
+                    }
+                }
+            } else {
+                val recoveryCandidate = enoughSamples &&
+                    (recentMedianHeartRate ?: Int.MAX_VALUE) <= heartRateRecoveryThresholdBpm
+                if (recoveryCandidate) {
+                    if (heartRateRecoveryStartedAtMillis == null) {
+                        heartRateRecoveryStartedAtMillis = now
+                    }
+                } else {
+                    heartRateRecoveryStartedAtMillis = null
+                }
+
+                if (heartRateAlertLevel == HeartRateAlertLevel.WARNING) {
+                    val criticalConfirmed = heartRateCriticalStartedAtMillis != null &&
+                        now - (heartRateCriticalStartedAtMillis ?: now) >= heartRateCriticalConfirmationMillis
+                    if (criticalConfirmed) {
+                        heartRateAlertLevel = HeartRateAlertLevel.CRITICAL
+                        forceRealtimeUpload = true
+                        statusMessage = "心率持续升高，升级为严重实时监测"
+                    }
+                } else if (heartRateAlertLevel == HeartRateAlertLevel.CRITICAL && !criticalCandidate && warningCandidate) {
+                    heartRateAlertLevel = HeartRateAlertLevel.WARNING
+                    forceRealtimeUpload = true
+                    statusMessage = "心率较峰值回落，降级为警告实时监测"
+                }
+
+                val recovered = heartRateRecoveryStartedAtMillis != null &&
+                    now - (heartRateRecoveryStartedAtMillis ?: now) >= heartRateRecoveryConfirmationMillis
+                if (recovered) {
+                    heartRateAlertLevel = HeartRateAlertLevel.NORMAL
+                    heartRateAlertEnteredAtMillis = null
+                    heartRateWarningStartedAtMillis = null
+                    heartRateCriticalStartedAtMillis = null
+                    heartRateRecoveryStartedAtMillis = null
+                    lastHeartRateAlertUploadAtMillis = null
+                    lastUploadedHeartRateAlertBpm = null
+                    exitRealtimeMonitoring = true
+                    statusMessage = "心率已恢复到正常范围，退出实时监测"
+                }
+            }
+        }
+
+        updateHeartRateAlertUiState(now)
+
+        statusMessage?.let { message ->
+            scope.launch {
+                _messageState.emit(ContinuousTrackingMessageState.Info(message))
+            }
+        }
+
+        if (exitRealtimeMonitoring) {
+            uploadHeartRateRecoverySnapshot(now)
+            heartRateCompletedForCurrentRun = true
+            heartRateCycleActive = false
+            updateTrackingUiFlags()
+            nextHeartRateCycleAtMillis = now + currentHeartRateBaselineSamplingIntervalMillis()
+            heartRateValidWindowStartedAtMillis = null
+            clearHeartRateStableSamples()
+            stopHeartRateTracker()
+            return
+        }
+
+        maybeUploadHeartRateAlertUpdate(now, force = forceRealtimeUpload)
+    }
+
+    private fun maybeUploadHeartRateAlertUpdate(now: Long, force: Boolean = false) {
+        val aggregateHeartRate = buildStableHeartRateValue(
+            snapshotHeartRateRecentSamples(heartRateAlertRealtimeAggregationWindowMillis)
+        ) ?: _dataState.value.liveHeartRateValue ?: return
+
+        val uploadDecision = synchronized(heartRateAlertLock) {
+            if (heartRateAlertLevel == HeartRateAlertLevel.NORMAL) {
+                return@synchronized null
+            }
+
+            val bpm = aggregateHeartRate.heartRate ?: return@synchronized null
+            val minUploadInterval = if (heartRateAlertLevel == HeartRateAlertLevel.CRITICAL) {
+                heartRateCriticalUploadIntervalMillis
+            } else {
+                heartRateWarningUploadIntervalMillis
+            }
+            val deltaFromLastUpload = lastUploadedHeartRateAlertBpm?.let { abs(bpm - it) } ?: Int.MAX_VALUE
+            val shouldUpload = force ||
+                lastHeartRateAlertUploadAtMillis == null ||
+                now - (lastHeartRateAlertUploadAtMillis ?: 0L) >= minUploadInterval ||
+                deltaFromLastUpload >= heartRateImmediateUploadDeltaBpm
+
+            if (!shouldUpload) {
+                return@synchronized null
+            }
+
+            lastHeartRateAlertUploadAtMillis = now
+            lastUploadedHeartRateAlertBpm = bpm
+            HeartRateAlertUploadDecision(
+                level = heartRateAlertLevel,
+                sustainedMillis = heartRateAlertEnteredAtMillis?.let { now - it } ?: 0L
+            )
+        } ?: return
+
+        scope.launch {
+            heartRateUploadMutex.withLock {
+                val samplingMode = if (uploadDecision.level == HeartRateAlertLevel.CRITICAL) {
+                    "critical_realtime"
+                } else {
+                    "warning_realtime"
+                }
+                val payload = buildHeartRatePayload(
+                    heartRateValue = aggregateHeartRate,
+                    samplingMode = samplingMode,
+                    alertLevel = uploadDecision.level.toUiValue(),
+                    sustainedMillis = uploadDecision.sustainedMillis,
+                    realtime = true
+                )
+
+                try {
+                    uploadPayloadNow(payload)
+                    val uploadedAtMillis = payload.getLong("timestamp")
+                    _dataState.value = _dataState.value.copy(
+                        heartRateValue = aggregateHeartRate,
+                        liveHeartRateValue = aggregateHeartRate,
+                        lastHeartRateUpdateAtMillis = now,
+                        lastUploadedSnapshot = UploadedSnapshot(
+                            uploadedAtMillis = uploadedAtMillis,
+                            sensorType = "HR",
+                            primaryText = "${aggregateHeartRate.heartRate ?: 0} bpm",
+                            secondaryText = "${uploadDecision.level.toUiValue()} realtime"
+                        )
+                    )
+                    updateHeartRateAlertUiState(now)
+                } catch (exception: Exception) {
+                    enqueuePendingUpload(sensorName = "心率预警", payload = payload)
+                    handleUploadFailure("心率预警", exception)
+                }
+            }
+        }
+    }
+
+    private fun uploadHeartRateRecoverySnapshot(now: Long) {
+        val aggregateHeartRate = buildStableHeartRateValue(
+            snapshotHeartRateRecentSamples(heartRateAlertRealtimeAggregationWindowMillis)
+        ) ?: _dataState.value.liveHeartRateValue ?: return
+
+        scope.launch {
+            heartRateUploadMutex.withLock {
+                val payload = buildHeartRatePayload(
+                    heartRateValue = aggregateHeartRate,
+                    samplingMode = "recovery",
+                    alertLevel = HeartRateAlertLevel.NORMAL.toUiValue(),
+                    sustainedMillis = 0L,
+                    realtime = true
+                )
+
+                try {
+                    uploadPayloadNow(payload)
+                    val uploadedAtMillis = payload.getLong("timestamp")
+                    _dataState.value = _dataState.value.copy(
+                        heartRateValue = aggregateHeartRate,
+                        liveHeartRateValue = aggregateHeartRate,
+                        lastHeartRateUpdateAtMillis = now,
+                        lastUploadedSnapshot = UploadedSnapshot(
+                            uploadedAtMillis = uploadedAtMillis,
+                            sensorType = "HR",
+                            primaryText = "${aggregateHeartRate.heartRate ?: 0} bpm",
+                            secondaryText = "recovered"
+                        )
+                    )
+                } catch (exception: Exception) {
+                    enqueuePendingUpload(sensorName = "心率恢复", payload = payload)
+                    handleUploadFailure("心率恢复", exception)
+                }
+            }
         }
     }
 
@@ -1140,7 +1597,7 @@ class ContinuousTrackingManager @Inject constructor(
         heartRateCompletedForCurrentRun = true
         heartRateCycleActive = false
         updateTrackingUiFlags()
-        nextHeartRateCycleAtMillis = now + heartRateSamplingIntervalMillis
+        nextHeartRateCycleAtMillis = now + currentHeartRateBaselineSamplingIntervalMillis()
         heartRateValidWindowStartedAtMillis = null
         clearHeartRateStableSamples()
         stopHeartRateTracker()
@@ -1316,9 +1773,10 @@ class ContinuousTrackingManager @Inject constructor(
     private fun <T> trimExpiredSamples(
         samples: ArrayDeque<T>,
         nowMillis: Long,
+        retentionMillis: Long = sampleBufferRetentionMillis,
         timestampOf: (T) -> Long
     ) {
-        while (samples.isNotEmpty() && nowMillis - timestampOf(samples.first()) > sampleBufferRetentionMillis) {
+        while (samples.isNotEmpty() && nowMillis - timestampOf(samples.first()) > retentionMillis) {
             samples.removeFirst()
         }
     }
@@ -1373,26 +1831,28 @@ class ContinuousTrackingManager @Inject constructor(
         }
     }
 
-    private suspend fun processValidEdaSamples(samples: List<EDAValue>) {
+    private suspend fun processValidEdaSamples(samples: List<CountedEdaSample>) {
         if (samples.isEmpty()) {
             return
         }
 
         edaUploadMutex.withLock {
-            val latestSample = samples.last()
+            val latestSample = samples.last().value
+            val cumulativeValidSampleCount = samples.last().validSampleCount
             val now = System.currentTimeMillis()
             val startedAtMillis = edaAcquisitionStartedAtMillis ?: now
             val elapsedMillis = (now - startedAtMillis).coerceAtLeast(0L)
-            val edaLabel = deriveEdaLabel(latestSample)
+            val edaLabel = deriveEdaLabel(samples.map { it.value })
+            val edaInterpretation = interpretEdaArousal(latestSample.skinConductance)
 
             _dataState.value = _dataState.value.copy(
                 edaValue = latestSample,
                 edaLabel = edaLabel,
-                edaValidSampleCount = samples.size,
+                edaValidSampleCount = cumulativeValidSampleCount,
                 lastEdaUpdateAtMillis = now
             )
             recordAcquisition(sensor = "EDA", elapsedMillis = elapsedMillis)
-            val payloads = samples.map { buildEdaPayload(it, edaLabel) }
+            val payloads = samples.map { buildEdaPayload(it.value, edaLabel, it.validSampleCount) }
             var nextPendingIndex = 0
 
             try {
@@ -1406,8 +1866,12 @@ class ContinuousTrackingManager @Inject constructor(
                     lastUploadedSnapshot = UploadedSnapshot(
                         uploadedAtMillis = uploadedAtMillis,
                         sensorType = "EDA",
-                        primaryText = String.format(Locale.getDefault(), "%.3f", latestSample.skinConductance ?: 0f),
-                        secondaryText = if (samples.size == 1) "instant" else "${samples.size} samples"
+                        primaryText = edaInterpretation.stateLabel ?: "EDA",
+                        secondaryText = if (cumulativeValidSampleCount == 1) {
+                            String.format(Locale.getDefault(), "%.3f uS - 1 sample", latestSample.skinConductance ?: 0f)
+                        } else {
+                            String.format(Locale.getDefault(), "%.3f uS - %d samples", latestSample.skinConductance ?: 0f, cumulativeValidSampleCount)
+                        }
                     )
                 )
                 _messageState.emit(
@@ -1479,6 +1943,22 @@ class ContinuousTrackingManager @Inject constructor(
         return newSamples
     }
 
+    private fun assignEdaValidSampleCounts(samples: List<EDAValue>): List<CountedEdaSample> {
+        if (samples.isEmpty()) {
+            return emptyList()
+        }
+
+        return synchronized(edaSessionLock) {
+            samples.map { sample ->
+                currentEdaCycleValidSampleCount += 1
+                CountedEdaSample(
+                    value = sample,
+                    validSampleCount = currentEdaCycleValidSampleCount
+                )
+            }
+        }
+    }
+
     private fun reserveNewHeartRateSamples(samples: List<HeartRateValue>): List<HeartRateValue> {
         if (samples.isEmpty()) {
             return emptyList()
@@ -1511,7 +1991,13 @@ class ContinuousTrackingManager @Inject constructor(
         }
     }
 
-    private fun buildHeartRatePayload(heartRateValue: HeartRateValue): JSONObject {
+    private fun buildHeartRatePayload(
+        heartRateValue: HeartRateValue,
+        samplingMode: String = "baseline",
+        alertLevel: String = HeartRateAlertLevel.NORMAL.toUiValue(),
+        sustainedMillis: Long? = null,
+        realtime: Boolean = false
+    ): JSONObject {
         val uploadedAtMillis = System.currentTimeMillis()
         return JSONObject().apply {
             put("timestamp", uploadedAtMillis)
@@ -1520,47 +2006,89 @@ class ContinuousTrackingManager @Inject constructor(
                 put("bpm", heartRateValue.heartRate)
                 put("status", heartRateValue.status)
                 put("sampleTimestamp", heartRateValue.timestamp)
+                put("monitoringMode", samplingMode)
+                put("alertLevel", alertLevel)
+                put("realtime", realtime)
+                sustainedMillis?.let { put("sustainedMillis", it) }
             })
         }
+    }
+
+    private fun updateEdaSignalState(edaValue: EDAValue) {
+        _dataState.value = _dataState.value.copy(
+            edaValue = edaValue,
+            edaLabel = deriveEdaLabel(edaValue),
+            lastEdaUpdateAtMillis = System.currentTimeMillis()
+        )
     }
 
     private fun deriveEdaLabel(edaValue: EDAValue): EdaWindowLabel {
         return when (edaValue.status) {
             EDAStatus.DETACHED -> EdaWindowLabel.DETACHED
             EDAStatus.LOW_SIGNAL -> EdaWindowLabel.LOW_SIGNAL
+            EDAStatus.NORMAL -> EdaWindowLabel.STABLE
+            else -> EdaWindowLabel.WAITING
+        }
+    }
+
+    private fun deriveEdaLabel(samples: List<EDAValue>): EdaWindowLabel {
+        val latestSample = samples.lastOrNull() ?: return EdaWindowLabel.WAITING
+        when (latestSample.status) {
+            EDAStatus.DETACHED -> return EdaWindowLabel.DETACHED
+            EDAStatus.LOW_SIGNAL -> return EdaWindowLabel.LOW_SIGNAL
+            EDAStatus.NORMAL -> Unit
+            else -> return EdaWindowLabel.WAITING
+        }
+
+        val values = samples
+            .mapNotNull { it.skinConductance }
+            .filter { it > 0f && it <= edaArtifactThresholdUs }
+        if (values.size < edaTrendMinimumSamples) {
+            return EdaWindowLabel.STABLE
+        }
+
+        val delta = values.last() - values.first()
+        val range = (values.maxOrNull() ?: values.last()) - (values.minOrNull() ?: values.first())
+        return when {
+            abs(delta) <= edaStableDeltaThresholdUs && range <= edaStableRangeThresholdUs -> EdaWindowLabel.STABLE
+            delta >= edaRisingDeltaThresholdUs -> EdaWindowLabel.RISING
+            delta <= -edaRisingDeltaThresholdUs -> EdaWindowLabel.RECOVERING
+            range >= edaVariableRangeThresholdUs -> EdaWindowLabel.VARIABLE
             else -> EdaWindowLabel.STABLE
         }
     }
 
-    private fun buildEdaPayload(edaValue: EDAValue, edaLabel: EdaWindowLabel): JSONObject {
+    private fun interpretEdaArousal(skinConductance: Float?): EdaArousalInterpretation {
+        return when {
+            skinConductance == null -> EdaArousalInterpretation(null, null, "unavailable")
+            skinConductance > edaArtifactThresholdUs -> EdaArousalInterpretation("Signal artifact", null, "unavailable")
+            skinConductance < 0.3f -> EdaArousalInterpretation("Calm", 1, "normal")
+            skinConductance < 1.0f -> EdaArousalInterpretation("Baseline", 2, "normal")
+            skinConductance < 2.0f -> EdaArousalInterpretation("Elevated arousal", 3, "warning")
+            else -> EdaArousalInterpretation("High arousal", 4, "warning")
+        }
+    }
+
+    private fun buildEdaPayload(
+        edaValue: EDAValue,
+        edaLabel: EdaWindowLabel,
+        validSampleCount: Int
+    ): JSONObject {
         val uploadedAtMillis = System.currentTimeMillis()
+        val interpretation = interpretEdaArousal(edaValue.skinConductance)
         return JSONObject().apply {
             put("timestamp", uploadedAtMillis)
             put("sensorType", "eda")
             put("eda", JSONObject().apply {
                 put("label", edaLabel.name)
-                put("validSampleCount", 1)
+                put("trend", edaLabel.name)
+                put("stateLabel", interpretation.stateLabel)
+                put("stateLevel", interpretation.stateLevel)
+                put("uiStatus", interpretation.uiStatus)
+                put("validSampleCount", validSampleCount)
                 put("skinConductance", edaValue.skinConductance)
                 put("sampleTimestamp", edaValue.timestamp)
             })
-        }
-    }
-
-    private fun buildWearStatusPayload(
-        isWorn: Boolean,
-        changedAtMillis: Long
-    ): JSONObject {
-        val powerSnapshot = _dataState.value.powerStatusSnapshot
-        return JSONObject().apply {
-            put("timestamp", changedAtMillis)
-            put("event", "wear_state")
-            put("isWorn", isWorn)
-            put("state", if (isWorn) "WORN" else "UNWORN")
-            powerSnapshot?.let { power ->
-                put("isCharging", power.isCharging)
-                put("chargeSource", power.chargeSource)
-                power.batteryLevelPercent?.let { put("batteryLevelPercent", it) }
-            }
         }
     }
 
@@ -1636,9 +2164,14 @@ class ContinuousTrackingManager @Inject constructor(
 
     private suspend fun uploadWearStatus(
         isWorn: Boolean,
-        changedAtMillis: Long
+        changedAtMillis: Long,
+        reason: String?
     ) {
-        val payload = buildWearStatusPayload(isWorn = isWorn, changedAtMillis = changedAtMillis)
+        val payload = buildWearStatusPayload(
+            isWorn = isWorn,
+            changedAtMillis = changedAtMillis,
+            reason = reason
+        )
         try {
             uploadPayloadNow(payload)
         } catch (exception: Exception) {
@@ -1663,6 +2196,14 @@ class ContinuousTrackingManager @Inject constructor(
         )
         try {
             uploadPayloadNow(payload)
+            _dataState.value = _dataState.value.copy(
+                lastUploadedSnapshot = UploadedSnapshot(
+                    uploadedAtMillis = changedAtMillis,
+                    sensorType = "POWER",
+                    primaryText = if (isCharging) "Charging" else "On battery",
+                    secondaryText = batteryLevelPercent?.let { "$it%" } ?: chargeSource
+                )
+            )
         } catch (exception: Exception) {
             enqueuePendingUpload(sensorName = "充电状态", payload = payload)
             throw exception
@@ -1879,9 +2420,56 @@ class ContinuousTrackingManager @Inject constructor(
         return storedPort.coerceIn(1, 65535)
     }
 
+    private fun loadShowSuccessPopup(): Boolean {
+        return preferences.getBoolean(popupSuccessEnabledKey, false)
+    }
+
+    private fun loadShowFailurePopup(): Boolean {
+        return preferences.getBoolean(popupFailureEnabledKey, true)
+    }
+
+    private fun loadHeartRateMonitoringMode(): HeartRateMonitoringMode {
+        val storedValue = preferences.getString(heartRateMonitoringModeKey, null)
+        return HeartRateMonitoringMode.fromUiValue(storedValue)
+    }
+
+    private fun currentHeartRateMonitoringMode(): HeartRateMonitoringMode {
+        return HeartRateMonitoringMode.fromUiValue(_dataState.value.heartRateMonitoringMode)
+    }
+
+    private fun currentHeartRateBaselineSamplingIntervalMillis(): Long {
+        return currentHeartRateMonitoringMode().baselineIntervalMillis
+    }
+
+    private fun currentHeartRateStaleRecoveryMillis(): Long {
+        return maxOf(
+            heartRateStaleRecoveryMinMillis,
+            currentHeartRateBaselineSamplingIntervalMillis() + heartRateStaleRecoveryBufferMillis
+        )
+    }
+
+    private fun rescheduleHeartRateBaselineForCurrentMode(now: Long) {
+        val alertMonitoringActive = synchronized(heartRateAlertLock) {
+            heartRateAlertLevel != HeartRateAlertLevel.NORMAL
+        }
+        if (alertMonitoringActive || heartRateCycleActive) {
+            return
+        }
+
+        val lastHeartRateAtMillis = _dataState.value.lastHeartRateUpdateAtMillis
+        nextHeartRateCycleAtMillis = if (lastHeartRateAtMillis == null) {
+            now
+        } else {
+            maxOf(now, lastHeartRateAtMillis + currentHeartRateBaselineSamplingIntervalMillis())
+        }
+    }
+
     private fun buildUploadEndpoint(): String {
         val snapshot = _dataState.value
-        return "http://${snapshot.uploadHost}:${snapshot.uploadPort}/api/samsung-watch"
+        return WatchEndpoints.samsungWatchUpload(
+            host = snapshot.uploadHost,
+            port = snapshot.uploadPort
+        )
     }
 
     private fun recordAcquisition(sensor: String, elapsedMillis: Long) {
@@ -1896,14 +2484,82 @@ class ContinuousTrackingManager @Inject constructor(
         return String.format(Locale.getDefault(), "%.1fs", elapsedMillis / 1000f)
     }
 
+    private fun buildWearStatusPayload(
+        isWorn: Boolean,
+        changedAtMillis: Long,
+        reason: String? = null
+    ): JSONObject {
+        val powerSnapshot = _dataState.value.powerStatusSnapshot
+        return JSONObject().apply {
+            put("timestamp", changedAtMillis)
+            put("event", "wear_state")
+            put("isWorn", isWorn)
+            put("state", if (isWorn) "WORN" else "UNWORN")
+            if (!reason.isNullOrBlank()) {
+                put("reason", reason)
+            }
+            powerSnapshot?.let { power ->
+                put("isCharging", power.isCharging)
+                put("chargeSource", power.chargeSource)
+                power.batteryLevelPercent?.let { put("batteryLevelPercent", it) }
+            }
+        }
+    }
+
+    private enum class HeartRateAlertLevel {
+        NORMAL,
+        WARNING,
+        CRITICAL;
+
+        fun toUiValue(): String = name.lowercase(Locale.US)
+    }
+
+    private enum class HeartRateMonitoringMode(
+        val storedValue: String,
+        val baselineIntervalMillis: Long,
+        val baselineIntervalMinutes: Int
+    ) {
+        STANDARD("standard", 3 * 60 * 1000L, 3),
+        HIGH_RISK("high_risk", 60_000L, 1);
+
+        fun toUiValue(): String = storedValue
+
+        companion object {
+            fun fromUiValue(value: String?): HeartRateMonitoringMode {
+                return values().firstOrNull { it.storedValue == value } ?: STANDARD
+            }
+        }
+    }
+
     private data class TimestampedSkinTempSample(
         val sample: SkinTempValue,
+        val receivedAtMillis: Long
+    )
+
+    private data class CountedEdaSample(
+        val value: EDAValue,
+        val validSampleCount: Int
+    )
+
+    private data class EdaArousalInterpretation(
+        val stateLabel: String?,
+        val stateLevel: Int?,
+        val uiStatus: String
+    )
+
+    private data class TimestampedHeartRateSample(
+        val sample: HeartRateValue,
         val receivedAtMillis: Long
     )
 
     private data class EcgSample(
         val timestamp: Long,
         val valueMv: Float
+    )
+
+    private data class HeartRateAlertUploadDecision(
+        val level: HeartRateAlertLevel,
+        val sustainedMillis: Long
     )
 
     private data class PendingUploadRecord(

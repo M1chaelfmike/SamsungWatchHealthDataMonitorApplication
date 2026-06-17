@@ -4,14 +4,17 @@
     <selectionStates>
       <SelectionState runConfigName="app">
         <option name="selectionMode" value="DROPDOWN" />
-        <DropdownSelection timestamp="2026-03-09T15:37:01.212193900Z">
+        <DropdownSelection timestamp="2026-04-16T08:48:16.870902600Z">
           <Target type="DEFAULT_BOOT">
             <handle>
-              <DeviceId pluginId="Default" identifier="serial=192.168.0.11:42791;connection=529188a8" />
+              <DeviceId pluginId="Default" identifier="serial=192.168.137.107:37157;connection=60d8e9b2" />
             </handle>
           </Target>
         </DropdownSelection>
         <DialogSelection />
+      </SelectionState>
+      <SelectionState runConfigName="Wear Idle - ContinuousMonitoringContentPreviewIdle">
+        <option name="selectionMode" value="DROPDOWN" />
       </SelectionState>
     </selectionStates>
   </component>

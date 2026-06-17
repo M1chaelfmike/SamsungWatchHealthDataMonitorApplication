@@ -82,7 +82,7 @@ EDA + Skin Temp</string>
     <string name="continuous_upload_target_title">Upload target</string>
     <string name="continuous_upload_target_host">Target IP</string>
     <string name="continuous_upload_target_port">Target port</string>
-    <string name="continuous_upload_target_edit">Edit</string>
+    <string name="continuous_upload_target_edit">Edit target</string>
     <string name="continuous_upload_target_save">Save</string>
     <string name="continuous_upload_target_saved">Upload target updated.</string>
     <string name="continuous_upload_target_invalid">Please enter a valid IP/host and port.</string>

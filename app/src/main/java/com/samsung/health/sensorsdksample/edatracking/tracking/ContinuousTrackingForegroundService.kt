@@ -4,6 +4,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.AdvertiseCallback
+import android.bluetooth.le.AdvertiseData
+import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.AdvertisingSetCallback
+import android.bluetooth.le.AdvertisingSetParameters
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -21,6 +27,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.samsung.health.sensorsdksample.edatracking.R
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingMessageState
+import com.samsung.health.sensorsdksample.edatracking.pairing.WatchPairingManager
 import com.samsung.health.sensorsdksample.edatracking.presentation.MainActivity
 import com.samsung.health.sensorsdksample.edatracking.presentation.MainActivity.Companion.APP_TAG
 import dagger.hilt.android.AndroidEntryPoint
@@ -33,6 +40,8 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import java.nio.ByteBuffer
+import java.util.UUID
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -41,17 +50,34 @@ class ContinuousTrackingForegroundService : Service() {
     @Inject
     lateinit var trackingManager: ContinuousTrackingManager
 
+    @Inject
+    lateinit var watchPairingManager: WatchPairingManager
+
+    // =====================================================
+    // BLE Advertising (watch as iBeacon/tag)
+    // =====================================================
+    private val beaconUuid: UUID = UUID.fromString("8f0a5a8c-6c3a-4c4f-9e2b-2c9c9f3c9e10")
+    private val beaconMajor: Int = 1
+    private val beaconMinor: Int = 1
+    private val beaconMeasuredPower: Byte = (-59).toByte()
+
+    private var beaconAdvertiseCallback: AdvertiseCallback? = null
+    private var beaconAdvertisingSetCallback: AdvertisingSetCallback? = null
+
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var trackingCoordinatorJob: Job? = null
     private var notificationStateJob: Job? = null
     private var recoveryJob: Job? = null
     private var messageLogJob: Job? = null
+    private var chargingHeartbeatJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var sensorManager: SensorManager? = null
     private var wearSensor: Sensor? = null
     private var lastWearState: Boolean? = null
     private var lastChargingState: Boolean? = null
     private var lastChargeSource: String? = null
+    private var lastBatteryLevelPercent: Int? = null
+    private var serviceStopStateReported = false
     private var batteryReceiverRegistered = false
     private var screenReceiverRegistered = false
     private val wearListener = object : SensorEventListener {
@@ -61,6 +87,7 @@ class ContinuousTrackingForegroundService : Service() {
                 return
             }
             lastWearState = isWorn
+            ensureBeaconAdvertisingRunning()
             trackingManager.onWearStateChanged(isWorn)
         }
 
@@ -96,37 +123,50 @@ class ContinuousTrackingForegroundService : Service() {
     }
 
     override fun onDestroy() {
-        trackingCoordinatorJob?.cancel()
-        trackingCoordinatorJob = null
-        notificationStateJob?.cancel()
-        notificationStateJob = null
-        recoveryJob?.cancel()
-        recoveryJob = null
-        messageLogJob?.cancel()
-        messageLogJob = null
-        unregisterScreenReceiver()
-        unregisterBatteryReceiver()
-        unregisterWearSensor()
-        releaseWakeLock()
-        trackingManager.stopTracking()
-        trackingManager.disconnect()
+        shutdownTrackingInfrastructure(reportServiceStoppedUnworn = true)
         super.onDestroy()
     }
 
     private fun startTrackingService() {
+        serviceStopStateReported = false
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(
             title = getString(R.string.continuous_service_title),
             text = getString(R.string.continuous_service_text)
         ))
+        // Keep the iBeacon alive for indoor positioning even when the watch is off-wrist.
+        ensureBeaconAdvertisingRunning()
         acquireWakeLock()
         registerScreenReceiver()
         registerBatteryReceiver()
         registerWearSensor()
+        watchPairingManager.start()
         trackingManager.connect()
+        if (chargingHeartbeatJob == null) {
+            chargingHeartbeatJob = serviceScope.launch {
+                while (isActive) {
+                    delay(CHARGING_POWER_STATUS_INTERVAL_MILLIS)
+                    if (lastChargingState == true) {
+                        publishLatestPowerState()
+                    }
+                }
+            }
+        }
         if (trackingCoordinatorJob == null) {
             trackingCoordinatorJob = serviceScope.launch {
-                trackingManager.connectionState.collectLatest { connectionState ->
+                combine(
+                    trackingManager.connectionState,
+                    watchPairingManager.pairingState
+                ) { connectionState, pairingState ->
+                    Pair(connectionState, pairingState)
+                }.collectLatest { (connectionState, pairingState) ->
+                    if (pairingState.requiresPairing) {
+                        if (trackingManager.progressState.value == com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingProgressState.Tracking) {
+                            trackingManager.stopTracking()
+                        }
+                        return@collectLatest
+                    }
+
                     if (connectionState == com.samsung.health.sensorsdksample.edatracking.data.ContinuousConnectionState.Connected &&
                         lastWearState != false &&
                         trackingManager.progressState.value != com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingProgressState.Tracking &&
@@ -157,6 +197,13 @@ class ContinuousTrackingForegroundService : Service() {
             recoveryJob = serviceScope.launch {
                 while (isActive) {
                     delay(5_000L)
+                    if (watchPairingManager.pairingState.value.requiresPairing) {
+                        if (trackingManager.progressState.value == com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingProgressState.Tracking) {
+                            trackingManager.stopTracking()
+                        }
+                        continue
+                    }
+
                     if (lastWearState == false) {
                         continue
                     }
@@ -193,6 +240,16 @@ class ContinuousTrackingForegroundService : Service() {
     }
 
     private fun stopTrackingService() {
+        shutdownTrackingInfrastructure(reportServiceStoppedUnworn = true)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun shutdownTrackingInfrastructure(reportServiceStoppedUnworn: Boolean) {
+        if (reportServiceStoppedUnworn && !serviceStopStateReported) {
+            trackingManager.reportServiceStoppedAsNotWorn()
+            serviceStopStateReported = true
+        }
         trackingCoordinatorJob?.cancel()
         trackingCoordinatorJob = null
         notificationStateJob?.cancel()
@@ -201,14 +258,15 @@ class ContinuousTrackingForegroundService : Service() {
         recoveryJob = null
         messageLogJob?.cancel()
         messageLogJob = null
+        chargingHeartbeatJob?.cancel()
+        chargingHeartbeatJob = null
+        stopBeaconAdvertisingIfNeeded()
         unregisterScreenReceiver()
         unregisterBatteryReceiver()
         unregisterWearSensor()
         releaseWakeLock()
         trackingManager.stopTracking()
         trackingManager.disconnect()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
     }
 
     private fun buildNotification(title: String, text: String) = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
@@ -387,16 +445,28 @@ class ContinuousTrackingForegroundService : Service() {
             null
         }
 
-        if (lastChargingState == isCharging && lastChargeSource == chargeSource) {
-            return
-        }
+        val shouldUpload = lastChargingState != isCharging ||
+            lastChargeSource != chargeSource ||
+            lastBatteryLevelPercent != batteryLevelPercent
 
         lastChargingState = isCharging
         lastChargeSource = chargeSource
+        lastBatteryLevelPercent = batteryLevelPercent
+
+        if (!shouldUpload) {
+            return
+        }
+
+        publishLatestPowerState()
+    }
+
+    private fun publishLatestPowerState() {
+        val isCharging = lastChargingState ?: return
+        val chargeSource = lastChargeSource ?: return
         trackingManager.onPowerStateChanged(
             isCharging = isCharging,
             chargeSource = chargeSource,
-            batteryLevelPercent = batteryLevelPercent
+            batteryLevelPercent = lastBatteryLevelPercent
         )
     }
 
@@ -436,9 +506,171 @@ class ContinuousTrackingForegroundService : Service() {
         screenReceiverRegistered = false
     }
 
+    private fun ensureBeaconAdvertisingRunning() {
+        startBeaconAdvertisingIfNeeded()
+    }
+
+    private fun startBeaconAdvertisingIfNeeded() {
+        if (beaconAdvertiseCallback != null || beaconAdvertisingSetCallback != null) {
+            return
+        }
+
+        try {
+            val bluetoothManager = getSystemService(BluetoothManager::class.java)
+            val adapter = bluetoothManager?.adapter
+            if (adapter == null || !adapter.isEnabled) {
+                Log.w(APP_TAG, "BLE advertising skipped: adapter unavailable or disabled")
+                return
+            }
+
+            val advertiser = adapter.bluetoothLeAdvertiser
+            if (advertiser == null) {
+                Log.w(APP_TAG, "BLE advertising skipped: advertiser unavailable")
+                return
+            }
+
+            val manufacturerData = buildIBeaconManufacturerData(
+                uuid = beaconUuid,
+                major = beaconMajor,
+                minor = beaconMinor,
+                measuredPower = beaconMeasuredPower
+            )
+
+            val advertiseData = AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .addManufacturerData(IBEACON_MANUFACTURER_ID, manufacturerData)
+                .build()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val parameters = AdvertisingSetParameters.Builder()
+                    .setLegacyMode(true)
+                    .setConnectable(false)
+                    .setScannable(false)
+                    // ~100ms interval for more reliable RSSI sampling while moving.
+                    .setInterval(AdvertisingSetParameters.INTERVAL_LOW)
+                    .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_HIGH)
+                    .build()
+
+                val callback = object : AdvertisingSetCallback() {
+                    override fun onAdvertisingSetStarted(
+                        advertisingSet: android.bluetooth.le.AdvertisingSet?,
+                        txPower: Int,
+                        status: Int
+                    ) {
+                        if (status == ADVERTISE_SUCCESS) {
+                            Log.i(APP_TAG, "iBeacon advertising started (set), txPower=$txPower")
+                        } else {
+                            Log.w(APP_TAG, "iBeacon advertising failed (set), status=$status")
+                        }
+                    }
+
+                    override fun onAdvertisingEnabled(advertisingSet: android.bluetooth.le.AdvertisingSet?, enable: Boolean, status: Int) {
+                        Log.i(APP_TAG, "iBeacon advertising enabled=$enable status=$status")
+                    }
+                }
+
+                beaconAdvertisingSetCallback = callback
+                advertiser.startAdvertisingSet(
+                    parameters,
+                    advertiseData,
+                    null,
+                    null,
+                    null,
+                    0,
+                    0,
+                    callback
+                )
+            } else {
+                val settings = AdvertiseSettings.Builder()
+                    .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                    .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+                    .setConnectable(false)
+                    .build()
+
+                val callback = object : AdvertiseCallback() {
+                    override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+                        Log.i(APP_TAG, "iBeacon advertising started")
+                    }
+
+                    override fun onStartFailure(errorCode: Int) {
+                        Log.w(APP_TAG, "iBeacon advertising failed, errorCode=$errorCode")
+                    }
+                }
+
+                beaconAdvertiseCallback = callback
+                advertiser.startAdvertising(settings, advertiseData, callback)
+            }
+        } catch (e: SecurityException) {
+            // Missing BLUETOOTH_ADVERTISE / BLUETOOTH_CONNECT runtime permission.
+            Log.w(APP_TAG, "BLE advertising permission error", e)
+        } catch (e: IllegalArgumentException) {
+            Log.w(APP_TAG, "BLE advertising config error", e)
+        }
+    }
+
+    private fun stopBeaconAdvertisingIfNeeded() {
+        val advertiseCallback = beaconAdvertiseCallback
+        val advertisingSetCallback = beaconAdvertisingSetCallback
+        if (advertiseCallback == null && advertisingSetCallback == null) {
+            return
+        }
+
+        try {
+            val bluetoothManager = getSystemService(BluetoothManager::class.java)
+            val adapter = bluetoothManager?.adapter
+            val advertiser = adapter?.bluetoothLeAdvertiser
+            if (advertiser == null) {
+                beaconAdvertiseCallback = null
+                beaconAdvertisingSetCallback = null
+                return
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && advertisingSetCallback != null) {
+                advertiser.stopAdvertisingSet(advertisingSetCallback)
+            }
+            if (advertiseCallback != null) {
+                advertiser.stopAdvertising(advertiseCallback)
+            }
+        } catch (e: SecurityException) {
+            Log.w(APP_TAG, "BLE advertising stop permission error", e)
+        } finally {
+            beaconAdvertiseCallback = null
+            beaconAdvertisingSetCallback = null
+        }
+    }
+
+    private fun buildIBeaconManufacturerData(
+        uuid: UUID,
+        major: Int,
+        minor: Int,
+        measuredPower: Byte
+    ): ByteArray {
+        // iBeacon format (manufacturer-specific data):
+        // 0x02 0x15 + 16B UUID + 2B major + 2B minor + 1B measured power
+        val payload = ByteArray(23)
+        payload[0] = 0x02
+        payload[1] = 0x15
+
+        val bb = ByteBuffer.wrap(ByteArray(16))
+        bb.putLong(uuid.mostSignificantBits)
+        bb.putLong(uuid.leastSignificantBits)
+        val uuidBytes = bb.array()
+        System.arraycopy(uuidBytes, 0, payload, 2, 16)
+
+        payload[18] = ((major shr 8) and 0xFF).toByte()
+        payload[19] = (major and 0xFF).toByte()
+        payload[20] = ((minor shr 8) and 0xFF).toByte()
+        payload[21] = (minor and 0xFF).toByte()
+        payload[22] = measuredPower
+
+        return payload
+    }
+
     companion object {
+        private const val IBEACON_MANUFACTURER_ID = 0x004C
         private const val NOTIFICATION_CHANNEL_ID = "continuous_tracking"
         private const val NOTIFICATION_ID = 3001
+        private const val CHARGING_POWER_STATUS_INTERVAL_MILLIS = 10 * 60 * 1000L
         private const val ACTION_START = "com.samsung.health.sensorsdksample.edatracking.action.START_CONTINUOUS"
         private const val ACTION_STOP = "com.samsung.health.sensorsdksample.edatracking.action.STOP_CONTINUOUS"
 

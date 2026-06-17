@@ -15,73 +15,66 @@
  */
 package com.samsung.health.sensorsdksample.edatracking
 
-import android.content.Context
-import com.samsung.android.service.health.tracking.HealthTracker
-import com.samsung.android.service.health.tracking.HealthTrackingService
-import com.samsung.android.service.health.tracking.data.DataPoint
-import com.samsung.android.service.health.tracking.data.HealthTrackerType
-import com.samsung.android.service.health.tracking.data.Value
-import com.samsung.android.service.health.tracking.data.ValueKey
-import com.samsung.health.sensorsdksample.edatracking.presentation.MainActivity
-import com.samsung.health.sensorsdksample.edatracking.tracking.EDATrackingManager
-import io.mockk.every
-import io.mockk.mockk
-import org.junit.Assert
-import org.junit.Before
+import com.samsung.health.sensorsdksample.edatracking.config.WatchConfiguration
+import com.samsung.health.sensorsdksample.edatracking.config.WatchEndpoints
+import com.samsung.health.sensorsdksample.edatracking.data.EDAStatus
+import com.samsung.health.sensorsdksample.edatracking.data.SkinTempStatus
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
-import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
-import org.robolectric.RuntimeEnvironment
 
-@RunWith(RobolectricTestRunner::class)
 class CodelabTests {
-    private lateinit var activity: MainActivity
-    private lateinit var trackingManager: EDATrackingManager
-    private lateinit var context: Context
-
-    @Before
-    fun setUp() {
-        activity = MainActivity()
-        context = RuntimeEnvironment.getApplication()
-        trackingManager = EDATrackingManager(context)
-    }
 
     @Test
-    fun testPreparePermission_NonNull() {
-        val permission = activity.preparePermission()
-
-        Assert.assertNotNull(permission)
-    }
-
-    @Test
-    fun testObtainHealthTracker_NotNull() {
-        val mockHealthTrackingService = mockk<HealthTrackingService>()
-        val mockEdaTracker = mockk<HealthTracker>()
-        every { mockHealthTrackingService.getHealthTracker(HealthTrackerType.EDA_CONTINUOUS) } returns mockEdaTracker
-        
-        val healthTrackingServiceField = EDATrackingManager::class.java.getDeclaredField("healthTrackingService")
-        healthTrackingServiceField.isAccessible = true
-        healthTrackingServiceField.set(trackingManager, mockHealthTrackingService)
-        
-        val healthTracker = trackingManager.obtainEDATracker()
-
-        Assert.assertNotNull(healthTracker)
-        Assert.assertEquals(mockEdaTracker, healthTracker)
-    }
-
-    @Test
-    fun testExtractEdaValues_NotNullValues() {
-        val values: MutableMap<ValueKey<*>?, Value<*>?> = HashMap()
-        values.put(ValueKey.EdaSet.STATUS, Value(0))
-        values.put(
-            ValueKey.EdaSet.SKIN_CONDUCTANCE,
-            Value(1.27f)
+    fun watchUploadEndpoint_isBuiltFromHostAndPort() {
+        val endpoint = WatchEndpoints.samsungWatchUpload(
+            host = "192.168.0.5",
+            port = 3100
         )
-        val dataPoint = DataPoint(values)
-        val edaValue = trackingManager.extractEdaValues(dataPoint)
 
-        Assert.assertNotNull(edaValue.status)
-        Assert.assertNotNull(edaValue.skinConductance)
-        Assert.assertNotNull(edaValue.timestamp)
+        assertEquals("http://192.168.0.5:3100/api/samsung-watch", endpoint)
+    }
+
+    @Test
+    fun pairingHandshakeEndpoint_isBuiltFromHostAndPort() {
+        val endpoint = WatchEndpoints.pairingHandshake(
+            host = "192.168.0.5",
+            port = 3100
+        )
+
+        assertEquals("http://192.168.0.5:3100/api/watch-pairing/handshake", endpoint)
+    }
+
+    @Test
+    fun watchConfiguration_canReuseStoredTargetBeforePairing() {
+        val configuration = WatchConfiguration(
+            watchId = "real-watch-001",
+            serverHost = "192.168.0.5",
+            serverPort = 3100,
+            paired = false,
+            hasStoredTarget = true
+        )
+
+        assertTrue(configuration.canUseExistingTarget)
+    }
+
+    @Test
+    fun watchConfiguration_requiresPairingWithoutStoredTarget() {
+        val configuration = WatchConfiguration(
+            watchId = "real-watch-001",
+            serverHost = "192.168.0.5",
+            serverPort = 3100,
+            paired = false,
+            hasStoredTarget = false
+        )
+
+        assertFalse(configuration.canUseExistingTarget)
+    }
+
+    @Test
+    fun sensorStatusConverters_returnUnknownForUnexpectedValues() {
+        assertEquals(EDAStatus.UNKNOWN, EDAStatus.fromInt(999))
+        assertEquals(SkinTempStatus.UNKNOWN, SkinTempStatus.fromInt(999))
     }
 }

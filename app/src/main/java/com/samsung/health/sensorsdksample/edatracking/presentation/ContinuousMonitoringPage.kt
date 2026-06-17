@@ -12,6 +12,13 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -41,9 +48,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Devices
 import androidx.compose.ui.tooling.preview.Preview
@@ -57,11 +72,15 @@ import com.samsung.health.sensorsdksample.edatracking.R
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousConnectionState
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingMessageState
 import com.samsung.health.sensorsdksample.edatracking.data.ContinuousTrackingProgressState
+import com.samsung.health.sensorsdksample.edatracking.data.EDAValue
 import com.samsung.health.sensorsdksample.edatracking.data.EdaWindowLabel
 import com.samsung.health.sensorsdksample.edatracking.data.HeartRateValue
 import com.samsung.health.sensorsdksample.edatracking.data.SkinTempStatus
 import com.samsung.health.sensorsdksample.edatracking.data.SkinTempValue
 import com.samsung.health.sensorsdksample.edatracking.data.WearStatusSnapshot
+import com.samsung.health.sensorsdksample.edatracking.config.WatchConfiguration
+import com.samsung.health.sensorsdksample.edatracking.pairing.WatchPairingReason
+import com.samsung.health.sensorsdksample.edatracking.pairing.WatchPairingState
 import com.samsung.health.sensorsdksample.edatracking.presentation.theme.AppTypography
 import com.samsung.health.sensorsdksample.edatracking.presentation.theme.EDATrackingTheme
 import com.samsung.health.sensorsdksample.edatracking.viewModel.ContinuousTrackingViewModel
@@ -72,14 +91,22 @@ private data class ContinuousMonitoringUiState(
     val connectionState: ContinuousConnectionState,
     val progressState: ContinuousTrackingProgressState,
     val wearStatusSnapshot: WearStatusSnapshot?,
+    val edaValue: EDAValue?,
     val edaLabel: EdaWindowLabel?,
     val lastEdaUpdateAtMillis: Long?,
     val skinTempValue: SkinTempValue?,
     val lastSkinTempUpdateAtMillis: Long?,
     val heartRateValue: HeartRateValue?,
     val lastHeartRateUpdateAtMillis: Long?,
+    val heartRateAlertLevel: String,
+    val heartRateRealtimeMonitoring: Boolean,
+    val heartRateAlertSustainedSeconds: Int,
+    val heartRateMonitoringMode: String,
+    val heartRateBaselineIntervalMinutes: Int,
     val uploadHost: String,
     val uploadPort: Int,
+    val showSuccessPopup: Boolean,
+    val showFailurePopup: Boolean,
     val ecgSupported: Boolean,
     val isAnySensorCycleActive: Boolean,
     val isEcgReadyToStart: Boolean,
@@ -93,6 +120,12 @@ private data class ContinuousMonitoringUiState(
     val lastEcgSampleCount: Int
 )
 
+private data class EdaDisplayState(
+    val primary: String,
+    val secondary: String,
+    val footer: String?
+)
+
 @Composable
 fun ContinuousMonitoringPage(
     viewModel: ContinuousTrackingViewModel,
@@ -103,6 +136,7 @@ fun ContinuousMonitoringPage(
     val dataState by viewModel.dataState.collectAsState()
     val progressState by viewModel.progressState.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
+    val pairingState by viewModel.pairingState.collectAsState()
     var showSettingsPrompt by remember { mutableStateOf(false) }
     var showUploadTargetDialog by remember { mutableStateOf(false) }
     var uploadHostInput by remember { mutableStateOf(dataState.uploadHost) }
@@ -129,18 +163,20 @@ fun ContinuousMonitoringPage(
         }
     }
 
-    LaunchedEffect(viewModel) {
+    LaunchedEffect(viewModel, dataState.showSuccessPopup, dataState.showFailurePopup) {
         viewModel.messageState.collect { messageState ->
             when (messageState) {
                 is ContinuousTrackingMessageState.UnsupportedSensors -> {
-                    val message = buildUnsupportedSensorsMessage(
-                        context = context,
-                        edaSupported = messageState.edaSupported,
-                        skinTemperatureSupported = messageState.skinTemperatureSupported,
-                        heartRateSupported = messageState.heartRateSupported,
-                        ppgSupported = messageState.ppgSupported
-                    )
-                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                    if (dataState.showFailurePopup) {
+                        val message = buildUnsupportedSensorsMessage(
+                            context = context,
+                            edaSupported = messageState.edaSupported,
+                            skinTemperatureSupported = messageState.skinTemperatureSupported,
+                            heartRateSupported = messageState.heartRateSupported,
+                            ppgSupported = messageState.ppgSupported
+                        )
+                        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                    }
                 }
 
                 is ContinuousTrackingMessageState.ResolvableError -> {
@@ -148,33 +184,46 @@ fun ContinuousMonitoringPage(
                 }
 
                 is ContinuousTrackingMessageState.PermissionError -> {
-                    Toast.makeText(context, missingPermissionText, Toast.LENGTH_LONG).show()
+                    if (dataState.showFailurePopup) {
+                        Toast.makeText(context, missingPermissionText, Toast.LENGTH_LONG).show()
+                    }
                 }
 
                 is ContinuousTrackingMessageState.Error -> {
-                    Toast.makeText(
-                        context,
-                        messageState.errorMessage ?: context.getString(R.string.continuous_error_other),
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    if (dataState.showFailurePopup) {
+                        Toast.makeText(
+                            context,
+                            messageState.errorMessage ?: context.getString(R.string.continuous_error_other),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
                 }
 
                 is ContinuousTrackingMessageState.Info -> {
-                    Toast.makeText(context, messageState.message, Toast.LENGTH_SHORT).show()
+                    if (dataState.showSuccessPopup) {
+                        Toast.makeText(context, messageState.message, Toast.LENGTH_SHORT).show()
+                    }
                 }
 
                 is ContinuousTrackingMessageState.TrackingInUse -> {
-                    Toast.makeText(
-                        context,
-                        context.getString(R.string.continuous_eda_in_use),
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    if (dataState.showFailurePopup) {
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.continuous_eda_in_use),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
                 }
             }
         }
     }
 
-    LaunchedEffect(connectionState, progressState) {
+    LaunchedEffect(pairingState.requiresPairing, connectionState, progressState) {
+        if (pairingState.requiresPairing) {
+            viewModel.stopBackgroundTracking(context)
+            return@LaunchedEffect
+        }
+
         if (
             progressState == ContinuousTrackingProgressState.Tracking ||
             progressState == ContinuousTrackingProgressState.TrackingDisabled
@@ -187,6 +236,16 @@ fun ContinuousMonitoringPage(
         } else {
             permissionLauncher.launch(requiredContinuousPermissions())
         }
+    }
+
+    if (pairingState.requiresPairing) {
+        WatchPairingPage(
+            pairingState = pairingState,
+            onSkip = { viewModel.skipPairingWithCurrentConfiguration() },
+            onRefresh = { viewModel.refreshPairingInfo() },
+            modifier = modifier
+        )
+        return
     }
 
     if (showSettingsPrompt) {
@@ -279,14 +338,22 @@ fun ContinuousMonitoringPage(
         connectionState = connectionState,
         progressState = progressState,
         wearStatusSnapshot = dataState.wearStatusSnapshot,
+        edaValue = dataState.edaValue,
         edaLabel = dataState.edaLabel,
         lastEdaUpdateAtMillis = dataState.lastEdaUpdateAtMillis,
         skinTempValue = dataState.skinTempValue,
         lastSkinTempUpdateAtMillis = dataState.lastSkinTempUpdateAtMillis,
         heartRateValue = dataState.heartRateValue,
         lastHeartRateUpdateAtMillis = dataState.lastHeartRateUpdateAtMillis,
+        heartRateAlertLevel = dataState.heartRateAlertLevel,
+        heartRateRealtimeMonitoring = dataState.heartRateRealtimeMonitoring,
+        heartRateAlertSustainedSeconds = dataState.heartRateAlertSustainedSeconds,
+        heartRateMonitoringMode = dataState.heartRateMonitoringMode,
+        heartRateBaselineIntervalMinutes = dataState.heartRateBaselineIntervalMinutes,
         uploadHost = dataState.uploadHost,
         uploadPort = dataState.uploadPort,
+        showSuccessPopup = dataState.showSuccessPopup,
+        showFailurePopup = dataState.showFailurePopup,
         ecgSupported = dataState.ecgSupported,
         isAnySensorCycleActive = dataState.isAnySensorCycleActive,
         isEcgReadyToStart = dataState.isEcgReadyToStart,
@@ -302,8 +369,22 @@ fun ContinuousMonitoringPage(
 
     ContinuousMonitoringContent(
         uiState = uiState,
+        pairingState = pairingState,
         editTargetButtonLabel = stringResource(R.string.continuous_upload_target_edit),
         onToggleEcgMeasurement = { viewModel.toggleEcgMeasurement() },
+        onToggleSuccessPopup = {
+            viewModel.updatePopupPreferences(showSuccessPopup = !dataState.showSuccessPopup)
+        },
+        onToggleFailurePopup = {
+            viewModel.updatePopupPreferences(showFailurePopup = !dataState.showFailurePopup)
+        },
+        onToggleHeartRateMonitoringMode = {
+            val nextMode = if (dataState.heartRateMonitoringMode == "high_risk") "standard" else "high_risk"
+            viewModel.updateHeartRateMonitoringMode(nextMode)
+        },
+        onRefreshPairing = {
+            viewModel.refreshPairingInfo()
+        },
         onEditTargetClick = {
             uploadHostInput = dataState.uploadHost
             uploadPortInput = dataState.uploadPort.toString()
@@ -317,18 +398,35 @@ fun ContinuousMonitoringPage(
 @Composable
 private fun ContinuousMonitoringContent(
     uiState: ContinuousMonitoringUiState,
+    pairingState: WatchPairingState,
     editTargetButtonLabel: String,
     onToggleEcgMeasurement: () -> Unit,
+    onToggleSuccessPopup: () -> Unit,
+    onToggleFailurePopup: () -> Unit,
+    onToggleHeartRateMonitoringMode: () -> Unit,
+    onRefreshPairing: () -> Unit,
     onEditTargetClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val pagerState = rememberPagerState(pageCount = { 3 })
-    val edaLines = listOf(
-        edaStatusLabel(uiState.progressState, uiState.edaLabel),
-        uiState.lastEdaUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No EDA update"
+    val edaDisplay = buildEdaDisplayState(
+        progressState = uiState.progressState,
+        edaValue = uiState.edaValue,
+        edaLabel = uiState.edaLabel,
+        lastEdaUpdateAtMillis = uiState.lastEdaUpdateAtMillis
     )
+    val heartRateStatusLine = when (uiState.heartRateAlertLevel.lowercase(Locale.getDefault())) {
+        "critical" -> "CRITICAL realtime ${uiState.heartRateAlertSustainedSeconds}s"
+        "warning" -> "WARNING realtime ${uiState.heartRateAlertSustainedSeconds}s"
+        else -> {
+            val minuteLabel = if (uiState.heartRateBaselineIntervalMinutes == 1) "min" else "mins"
+            val modeLabel = if (uiState.heartRateMonitoringMode == "high_risk") "High-risk" else "Standard"
+            "$modeLabel baseline ${uiState.heartRateBaselineIntervalMinutes} $minuteLabel"
+        }
+    }
     val heartRateLines = listOf(
         uiState.heartRateValue?.heartRate?.let { "$it bpm" } ?: "Waiting HR",
+        heartRateStatusLine,
         uiState.lastHeartRateUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No HR update"
     )
     val skinTempLines = listOf(
@@ -354,7 +452,7 @@ private fun ContinuousMonitoringContent(
             when (page) {
                 0 -> PrimaryWearPage(
                     uiState = uiState,
-                    edaLines = edaLines,
+                    edaDisplay = edaDisplay,
                     heartRateLines = heartRateLines,
                     skinTempLines = skinTempLines
                 )
@@ -364,16 +462,20 @@ private fun ContinuousMonitoringContent(
                     onToggleEcgMeasurement = onToggleEcgMeasurement
                 )
 
-                else -> PageFrame {
-                    EditableMetricBlock(
-                        title = "TARGET",
-                        lines = targetLines,
-                        buttonLabel = editTargetButtonLabel,
-                        onEditClick = onEditTargetClick,
-                        cardHeight = 132.dp,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
+                else -> SettingsPage(
+                    pairingState = pairingState,
+                    targetLines = targetLines,
+                    editTargetButtonLabel = editTargetButtonLabel,
+                    heartRateMonitoringMode = uiState.heartRateMonitoringMode,
+                    heartRateBaselineIntervalMinutes = uiState.heartRateBaselineIntervalMinutes,
+                    showSuccessPopup = uiState.showSuccessPopup,
+                    showFailurePopup = uiState.showFailurePopup,
+                    onRefreshPairing = onRefreshPairing,
+                    onEditTargetClick = onEditTargetClick,
+                    onToggleHeartRateMonitoringMode = onToggleHeartRateMonitoringMode,
+                    onToggleSuccessPopup = onToggleSuccessPopup,
+                    onToggleFailurePopup = onToggleFailurePopup
+                )
             }
         }
 
@@ -390,53 +492,80 @@ private fun ContinuousMonitoringContent(
 @Composable
 private fun PrimaryWearPage(
     uiState: ContinuousMonitoringUiState,
-    edaLines: List<String>,
+    edaDisplay: EdaDisplayState,
     heartRateLines: List<String>,
     skinTempLines: List<String>
 ) {
+    val heartAccent = when (uiState.heartRateAlertLevel.lowercase(Locale.getDefault())) {
+        "critical" -> Color(0xFFFF5B6E)
+        "warning" -> Color(0xFFFFB74D)
+        else -> Color(0xFFFF6F80)
+    }
+    val isTracking = uiState.progressState == ContinuousTrackingProgressState.Tracking
+
     ScalingLazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 12.dp),
+            .padding(horizontal = 10.dp),
         contentPadding = PaddingValues(vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        verticalArrangement = Arrangement.spacedBy(7.dp)
     ) {
         item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                LabeledStatusIndicator(
-                    label = "WEAR",
-                    active = uiState.wearStatusSnapshot?.isWorn == true,
-                    inactiveColor = Color(0xFFE39B9B),
-                    unknown = uiState.wearStatusSnapshot == null
-                )
-            }
-        }
-        item {
-            ContinuousMetricBlock(
-                title = "EDA",
-                lines = edaLines,
-                cardHeight = 88.dp,
+            WearHeaderPill(
+                isWorn = uiState.wearStatusSnapshot?.isWorn,
+                progressState = uiState.progressState,
                 modifier = Modifier.fillMaxWidth()
             )
         }
         item {
-            ContinuousMetricBlock(
+            VisualMetricBlock(
                 title = "HR",
-                lines = heartRateLines,
-                cardHeight = 88.dp,
+                primary = heartRateLines.getOrElse(0) { "Waiting HR" },
+                secondary = heartRateLines.getOrElse(1) { "Baseline" },
+                footer = heartRateLines.getOrNull(2),
+                accentColor = heartAccent,
+                cardHeight = 106.dp,
+                icon = {
+                    HeartLineIcon(
+                        active = isTracking && uiState.heartRateValue?.heartRate != null,
+                        color = heartAccent
+                    )
+                },
                 modifier = Modifier.fillMaxWidth()
             )
         }
         item {
-            ContinuousMetricBlock(
+            VisualMetricBlock(
+                title = "EDA",
+                primary = edaDisplay.primary,
+                secondary = edaDisplay.secondary,
+                footer = edaDisplay.footer,
+                accentColor = Color(0xFF6FE7D1),
+                cardHeight = 94.dp,
+                icon = {
+                    EdaWaveIcon(
+                        active = isTracking,
+                        color = Color(0xFF6FE7D1)
+                    )
+                },
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        item {
+            VisualMetricBlock(
                 title = "TEMP",
-                lines = skinTempLines,
+                primary = skinTempLines.getOrElse(0) { "WS --" },
+                secondary = skinTempLines.getOrElse(1) { "AT --" },
+                footer = skinTempLines.getOrNull(2),
+                accentColor = Color(0xFFFFD166),
                 cardHeight = 96.dp,
+                icon = {
+                    ThermometerLineIcon(
+                        active = isTracking,
+                        color = Color(0xFFFFD166)
+                    )
+                },
                 modifier = Modifier.fillMaxWidth()
             )
         }
@@ -473,18 +602,33 @@ private fun EcgMeasurementPage(
         else -> "Press Start and hold finger for 30s"
     }
 
-    PageFrame {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            ContinuousMetricBlock(
+    ScalingLazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 10.dp),
+        contentPadding = PaddingValues(top = 12.dp, bottom = 36.dp),
+        autoCentering = null,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        item {
+            VisualMetricBlock(
                 title = "ECG",
-                lines = if (statusLines.isEmpty()) listOf("Ready") else statusLines,
-                cardHeight = 104.dp,
+                primary = statusLines.getOrElse(0) { "Ready" },
+                secondary = statusLines.getOrNull(1) ?: if (uiState.ecgSupported) "On demand" else "Unavailable",
+                footer = statusLines.drop(2).firstOrNull(),
+                accentColor = Color(0xFFA7C7FF),
+                cardHeight = 112.dp,
+                icon = {
+                    EcgLineIcon(
+                        active = uiState.ecgMeasurementRunning,
+                        color = Color(0xFFA7C7FF)
+                    )
+                },
                 modifier = Modifier.fillMaxWidth()
             )
+        }
+        item {
             WearActionButton(
                 label = when {
                     uiState.ecgMeasurementRunning -> "STOP ECG"
@@ -494,11 +638,69 @@ private fun EcgMeasurementPage(
                 enabled = buttonEnabled,
                 onClick = onToggleEcgMeasurement
             )
+        }
+        item {
             Text(
                 text = helperText,
                 style = AppTypography.bodySmall,
                 color = Color.White,
                 textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsPage(
+    pairingState: WatchPairingState,
+    targetLines: List<String>,
+    editTargetButtonLabel: String,
+    heartRateMonitoringMode: String,
+    heartRateBaselineIntervalMinutes: Int,
+    showSuccessPopup: Boolean,
+    showFailurePopup: Boolean,
+    onRefreshPairing: () -> Unit,
+    onEditTargetClick: () -> Unit,
+    onToggleHeartRateMonitoringMode: () -> Unit,
+    onToggleSuccessPopup: () -> Unit,
+    onToggleFailurePopup: () -> Unit
+) {
+    ScalingLazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 10.dp),
+        contentPadding = PaddingValues(top = 12.dp, bottom = 38.dp),
+        autoCentering = null,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        item {
+            PairingStatusBlock(
+                pairingState = pairingState,
+                onRefresh = onRefreshPairing,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        item {
+            EditableMetricBlock(
+                title = "TARGET",
+                lines = targetLines,
+                buttonLabel = editTargetButtonLabel,
+                onEditClick = onEditTargetClick,
+                cardHeight = 142.dp,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        item {
+            PopupConfigBlock(
+                heartRateMonitoringMode = heartRateMonitoringMode,
+                heartRateBaselineIntervalMinutes = heartRateBaselineIntervalMinutes,
+                onToggleHeartRateMonitoringMode = onToggleHeartRateMonitoringMode,
+                showSuccessPopup = showSuccessPopup,
+                showFailurePopup = showFailurePopup,
+                onToggleSuccessPopup = onToggleSuccessPopup,
+                onToggleFailurePopup = onToggleFailurePopup,
+                modifier = Modifier.fillMaxWidth()
             )
         }
     }
@@ -516,8 +718,13 @@ private fun ContinuousMonitoringContentPreviewTracking() {
     EDATrackingTheme {
         ContinuousMonitoringContent(
             uiState = previewUiState(),
+            pairingState = previewPairingState(),
             editTargetButtonLabel = "Edit target",
             onToggleEcgMeasurement = {},
+            onToggleSuccessPopup = {},
+            onToggleFailurePopup = {},
+            onToggleHeartRateMonitoringMode = {},
+            onRefreshPairing = {},
             onEditTargetClick = {}
         )
     }
@@ -538,6 +745,7 @@ private fun ContinuousMonitoringContentPreviewIdle() {
                 connectionState = ContinuousConnectionState.Connected,
                 progressState = ContinuousTrackingProgressState.Idle,
                 wearStatusSnapshot = null,
+                edaValue = null,
                 edaLabel = null,
                 lastEdaUpdateAtMillis = null,
                 skinTempValue = null,
@@ -546,32 +754,91 @@ private fun ContinuousMonitoringContentPreviewIdle() {
                 lastHeartRateUpdateAtMillis = null,
                 ecgStatusText = "Ready"
             ),
+            pairingState = previewPairingState(),
             editTargetButtonLabel = "Edit target",
             onToggleEcgMeasurement = {},
+            onToggleSuccessPopup = {},
+            onToggleFailurePopup = {},
+            onToggleHeartRateMonitoringMode = {},
+            onRefreshPairing = {},
             onEditTargetClick = {}
         )
     }
 }
 
-private fun edaStatusLabel(
+private fun previewPairingState(): WatchPairingState {
+    return WatchPairingState(
+        requiresPairing = false,
+        canSkip = true,
+        receiverRunning = true,
+        receiverPort = 8765,
+        watchIp = "192.168.0.24",
+        macAddress = "A1:B2:C3:D4:E5:F6",
+        pairingCode = "123456",
+        configuration = WatchConfiguration(
+            watchId = "real-watch-001",
+            serverHost = "192.168.0.5",
+            serverPort = 3100,
+            paired = true,
+            hasStoredTarget = true
+        ),
+        reason = WatchPairingReason.PAIRED,
+        message = "Configuration ready"
+    )
+}
+
+private fun buildEdaDisplayState(
     progressState: ContinuousTrackingProgressState,
-    edaLabel: EdaWindowLabel?
-): String {
+    edaValue: EDAValue?,
+    edaLabel: EdaWindowLabel?,
+    lastEdaUpdateAtMillis: Long?
+): EdaDisplayState {
+    val footer = lastEdaUpdateAtMillis?.let { "At ${formatClockTime(it)}" } ?: "No EDA update"
     return when (progressState) {
         ContinuousTrackingProgressState.Tracking -> when (edaLabel) {
-            EdaWindowLabel.DETACHED -> "Wear check"
-            EdaWindowLabel.LOW_SIGNAL -> "Low signal"
+            EdaWindowLabel.DETACHED -> EdaDisplayState("Wear check", "Adjust watch fit", footer)
+            EdaWindowLabel.LOW_SIGNAL -> EdaDisplayState("Low signal", "Keep wrist steady", footer)
             EdaWindowLabel.STABLE,
             EdaWindowLabel.RISING,
             EdaWindowLabel.RECOVERING,
-            EdaWindowLabel.VARIABLE -> "Running"
+            EdaWindowLabel.VARIABLE -> {
+                val raw = edaValue?.skinConductance
+                EdaDisplayState(
+                    primary = edaArousalLabel(raw) ?: "Listening",
+                    secondary = edaReadingLine(raw, edaLabel),
+                    footer = footer
+                )
+            }
             EdaWindowLabel.WAITING,
-            null -> "Listening"
+            null -> EdaDisplayState("Listening", edaReadingLine(edaValue?.skinConductance, edaLabel), footer)
         }
 
-        ContinuousTrackingProgressState.Idle -> "Waiting"
-        ContinuousTrackingProgressState.TrackingDisabled -> "Disabled"
+        ContinuousTrackingProgressState.Idle -> EdaDisplayState("Waiting", "Start tracking", footer)
+        ContinuousTrackingProgressState.TrackingDisabled -> EdaDisplayState("Disabled", "Sensor unavailable", footer)
     }
+}
+
+private fun edaArousalLabel(skinConductance: Float?): String? {
+    return when {
+        skinConductance == null -> null
+        skinConductance > 5f -> "Signal artifact"
+        skinConductance < 0.3f -> "Calm"
+        skinConductance < 1.0f -> "Baseline"
+        skinConductance < 2.0f -> "Elevated"
+        else -> "High"
+    }
+}
+
+private fun edaReadingLine(skinConductance: Float?, edaLabel: EdaWindowLabel?): String {
+    val reading = skinConductance?.let { String.format(Locale.getDefault(), "%.3f uS", it) } ?: "Waiting signal"
+    val trend = when (edaLabel) {
+        EdaWindowLabel.STABLE -> "Stable"
+        EdaWindowLabel.RISING -> "Rising"
+        EdaWindowLabel.RECOVERING -> "Recovering"
+        EdaWindowLabel.VARIABLE -> "Variable"
+        else -> null
+    }
+    return listOfNotNull(reading, trend).joinToString(" - ")
 }
 
 private fun formatClockTime(timeMillis: Long): String {
@@ -585,6 +852,171 @@ private fun formatClockTime(timeMillis: Long): String {
         calendar.get(Calendar.MINUTE),
         calendar.get(Calendar.SECOND)
     )
+}
+
+@Composable
+private fun WearHeaderPill(
+    isWorn: Boolean?,
+    progressState: ContinuousTrackingProgressState,
+    modifier: Modifier = Modifier
+) {
+    val active = isWorn == true
+    val statusText = when {
+        isWorn == false -> "Off wrist"
+        progressState == ContinuousTrackingProgressState.Tracking -> "Collecting"
+        progressState == ContinuousTrackingProgressState.TrackingDisabled -> "Sensors off"
+        else -> "Ready"
+    }
+    val accent = when {
+        isWorn == false -> Color(0xFFFF8A8A)
+        progressState == ContinuousTrackingProgressState.Tracking -> Color(0xFF9AE6B4)
+        else -> Color(0xFFA7C7FF)
+    }
+    val shape = RoundedCornerShape(8.dp)
+
+    Row(
+        modifier = modifier
+            .clip(shape)
+            .background(Color(0xFF101318))
+            .border(width = 1.dp, color = accent.copy(alpha = 0.45f), shape = shape)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        ContinuousStatusIndicator(
+            active = active,
+            inactiveColor = if (isWorn == null) Color(0xFF6F7682) else Color(0xFFFF8A8A)
+        )
+        Spacer(modifier = Modifier.size(8.dp))
+        Text(
+            text = statusText,
+            style = AppTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+            color = Color.White,
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+@Composable
+private fun PairingStatusBlock(
+    pairingState: WatchPairingState,
+    onRefresh: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val configuration = pairingState.configuration
+    val accentColor = pairingAccentColor(pairingState)
+    val shape = RoundedCornerShape(8.dp)
+    val statusText = if (configuration.paired && !pairingState.requiresPairing) {
+        "Paired"
+    } else {
+        "Needs setup"
+    }
+    val receiverText = if (pairingState.receiverRunning) {
+        "Receiver ${pairingState.receiverPort}"
+    } else {
+        "Receiver off"
+    }
+    val watchIp = pairingState.watchIp ?: "IP unavailable"
+    val pairingCode = pairingState.pairingCode.ifBlank { "Unavailable" }
+    val target = "${configuration.serverHost}:${configuration.serverPort}"
+    val detailText = pairingState.message ?: pairingReasonLabel(pairingState.reason)
+
+    Box(
+        modifier = modifier
+            .height(214.dp)
+            .clip(shape)
+            .background(
+                brush = Brush.linearGradient(
+                    colors = listOf(Color(0xFF151922), Color(0xFF0C0F15))
+                ),
+                shape = shape
+            )
+            .border(width = 1.dp, color = accentColor.copy(alpha = 0.38f), shape = shape)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = "PAIRING",
+                style = AppTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                textAlign = TextAlign.Center,
+                color = accentColor
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ContinuousStatusIndicator(
+                    active = configuration.paired && pairingState.receiverRunning,
+                    inactiveColor = Color(0xFFFF8A8A)
+                )
+                Spacer(modifier = Modifier.size(8.dp))
+                Text(
+                    text = "$statusText | $receiverText",
+                    style = AppTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                    textAlign = TextAlign.Center,
+                    color = Color.White
+                )
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = detailText,
+                style = AppTypography.bodySmall,
+                textAlign = TextAlign.Center,
+                color = Color(0xFFD8DEE9)
+            )
+            Spacer(modifier = Modifier.height(5.dp))
+            PairingInfoLine(label = "Watch", value = configuration.watchId)
+            PairingInfoLine(label = "Code", value = pairingCode)
+            PairingInfoLine(label = "Target", value = target)
+            PairingInfoLine(label = "IP", value = watchIp)
+            Spacer(modifier = Modifier.height(6.dp))
+            InlineToggleButton(
+                label = "Refresh info",
+                active = true,
+                accentColor = accentColor,
+                onClick = onRefresh
+            )
+        }
+    }
+}
+
+@Composable
+private fun PairingInfoLine(
+    label: String,
+    value: String
+) {
+    Text(
+        text = "$label: $value",
+        style = AppTypography.bodySmall,
+        textAlign = TextAlign.Center,
+        color = Color(0xFFB8C7D9)
+    )
+}
+
+private fun pairingReasonLabel(reason: WatchPairingReason): String {
+    return when (reason) {
+        WatchPairingReason.FIRST_LAUNCH -> "First launch"
+        WatchPairingReason.NETWORK_CHANGED -> "Network changed"
+        WatchPairingReason.WAITING_FOR_CONFIG -> "Waiting for server config"
+        WatchPairingReason.PAIRED -> "Configuration ready"
+        WatchPairingReason.RECEIVER_ERROR -> "Receiver error"
+    }
+}
+
+private fun pairingAccentColor(pairingState: WatchPairingState): Color {
+    return when {
+        pairingState.reason == WatchPairingReason.RECEIVER_ERROR -> Color(0xFFFF8A8A)
+        pairingState.requiresPairing -> Color(0xFFFFB74D)
+        pairingState.configuration.paired -> Color(0xFF9AE6B4)
+        else -> Color(0xFFA7C7FF)
+    }
 }
 
 @Composable
@@ -681,45 +1113,272 @@ private fun WearActionButton(
 }
 
 @Composable
-private fun ContinuousMetricBlock(
+private fun VisualMetricBlock(
     title: String,
-    lines: List<String>,
+    primary: String,
+    secondary: String,
+    footer: String?,
+    accentColor: Color,
     cardHeight: Dp,
+    icon: @Composable () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val shape = RoundedCornerShape(8.dp)
     Box(
         modifier = modifier
             .height(cardHeight)
+            .clip(shape)
             .background(
-                color = Color(0xFFF3F3F3),
-                shape = RoundedCornerShape(20.dp)
+                brush = Brush.linearGradient(
+                    colors = listOf(
+                        Color(0xFF14171D),
+                        Color(0xFF0B0D11)
+                    )
+                ),
+                shape = shape
             )
+            .border(width = 1.dp, color = accentColor.copy(alpha = 0.38f), shape = shape)
     ) {
-        Column(
+        Row(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+                .padding(horizontal = 12.dp, vertical = 9.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = title,
-                style = AppTypography.bodySmall,
-                textAlign = TextAlign.Center,
-                color = Color.Black
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            lines.forEachIndexed { index, line ->
+            Box(
+                modifier = Modifier
+                    .size(52.dp)
+                    .clip(CircleShape)
+                    .background(accentColor.copy(alpha = 0.12f))
+                    .border(width = 1.dp, color = accentColor.copy(alpha = 0.38f), shape = CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                icon()
+            }
+            Column(
+                modifier = Modifier.weight(1f),
+                horizontalAlignment = Alignment.Start,
+                verticalArrangement = Arrangement.Center
+            ) {
                 Text(
-                    text = line,
-                    style = AppTypography.bodySmall,
-                    textAlign = TextAlign.Center,
-                    color = Color.Black
+                    text = title,
+                    style = AppTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                    textAlign = TextAlign.Start,
+                    color = accentColor
                 )
-                if (index != lines.lastIndex) {
+                Spacer(modifier = Modifier.height(3.dp))
+                Text(
+                    text = primary,
+                    style = AppTypography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                    textAlign = TextAlign.Start,
+                    color = Color.White
+                )
+                Text(
+                    text = secondary,
+                    style = AppTypography.bodySmall,
+                    textAlign = TextAlign.Start,
+                    color = Color(0xFFD8DEE9)
+                )
+                if (!footer.isNullOrBlank()) {
                     Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = footer,
+                        style = AppTypography.bodySmall,
+                        textAlign = TextAlign.Start,
+                        color = Color(0xFF8D96A5)
+                    )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun HeartLineIcon(
+    active: Boolean,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    val transition = rememberInfiniteTransition(label = "heart-pulse")
+    val pulse by transition.animateFloat(
+        initialValue = 0.92f,
+        targetValue = 1.14f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 520, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "heart-scale"
+    )
+    val scale = if (active) pulse else 1f
+
+    Canvas(
+        modifier = modifier
+            .size(34.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+    ) {
+        val w = size.width
+        val h = size.height
+        val heart = Path().apply {
+            moveTo(w * 0.50f, h * 0.82f)
+            cubicTo(w * 0.10f, h * 0.57f, w * 0.10f, h * 0.22f, w * 0.32f, h * 0.20f)
+            cubicTo(w * 0.44f, h * 0.19f, w * 0.50f, h * 0.31f, w * 0.50f, h * 0.31f)
+            cubicTo(w * 0.50f, h * 0.31f, w * 0.56f, h * 0.19f, w * 0.68f, h * 0.20f)
+            cubicTo(w * 0.90f, h * 0.22f, w * 0.90f, h * 0.57f, w * 0.50f, h * 0.82f)
+        }
+        drawPath(
+            path = heart,
+            color = color,
+            style = Stroke(
+                width = 3.dp.toPx(),
+                cap = StrokeCap.Round,
+                join = StrokeJoin.Round
+            )
+        )
+    }
+}
+
+@Composable
+private fun EdaWaveIcon(
+    active: Boolean,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    val transition = rememberInfiniteTransition(label = "eda-wave")
+    val glow by transition.animateFloat(
+        initialValue = 0.25f,
+        targetValue = 0.75f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "eda-glow"
+    )
+
+    Canvas(modifier = modifier.size(36.dp)) {
+        val w = size.width
+        val h = size.height
+        val centerY = h * 0.54f
+        drawCircle(
+            color = color.copy(alpha = if (active) glow * 0.25f else 0.10f),
+            radius = size.minDimension * 0.46f
+        )
+        val wave = Path().apply {
+            moveTo(w * 0.08f, centerY)
+            cubicTo(w * 0.18f, h * 0.26f, w * 0.28f, h * 0.82f, w * 0.39f, centerY)
+            cubicTo(w * 0.50f, h * 0.26f, w * 0.60f, h * 0.82f, w * 0.72f, centerY)
+            cubicTo(w * 0.80f, h * 0.36f, w * 0.88f, h * 0.48f, w * 0.94f, centerY)
+        }
+        drawPath(
+            path = wave,
+            color = color,
+            style = Stroke(
+                width = 2.4.dp.toPx(),
+                cap = StrokeCap.Round,
+                join = StrokeJoin.Round
+            )
+        )
+    }
+}
+
+@Composable
+private fun ThermometerLineIcon(
+    active: Boolean,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    val transition = rememberInfiniteTransition(label = "temp-glow")
+    val heat by transition.animateFloat(
+        initialValue = 0.30f,
+        targetValue = 0.75f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1400, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "temp-heat"
+    )
+    val alpha = if (active) heat else 0.42f
+
+    Canvas(modifier = modifier.size(36.dp)) {
+        val x = size.width * 0.50f
+        val top = size.height * 0.16f
+        val bottom = size.height * 0.68f
+        val bulbRadius = size.minDimension * 0.16f
+        drawLine(
+            color = color,
+            start = androidx.compose.ui.geometry.Offset(x, top),
+            end = androidx.compose.ui.geometry.Offset(x, bottom),
+            strokeWidth = 3.dp.toPx(),
+            cap = StrokeCap.Round
+        )
+        drawCircle(
+            color = color.copy(alpha = alpha),
+            radius = bulbRadius,
+            center = androidx.compose.ui.geometry.Offset(x, size.height * 0.76f)
+        )
+        drawCircle(
+            color = color,
+            radius = bulbRadius,
+            center = androidx.compose.ui.geometry.Offset(x, size.height * 0.76f),
+            style = Stroke(width = 2.2.dp.toPx())
+        )
+        listOf(0.26f, 0.42f, 0.58f).forEach { yRatio ->
+            drawLine(
+                color = color.copy(alpha = 0.65f),
+                start = androidx.compose.ui.geometry.Offset(size.width * 0.58f, size.height * yRatio),
+                end = androidx.compose.ui.geometry.Offset(size.width * 0.74f, size.height * yRatio),
+                strokeWidth = 1.5.dp.toPx(),
+                cap = StrokeCap.Round
+            )
+        }
+    }
+}
+
+@Composable
+private fun EcgLineIcon(
+    active: Boolean,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    val transition = rememberInfiniteTransition(label = "ecg-sweep")
+    val sweep by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(animation = tween(durationMillis = 1250)),
+        label = "ecg-dot"
+    )
+
+    Canvas(modifier = modifier.size(38.dp)) {
+        val w = size.width
+        val h = size.height
+        val y = h * 0.55f
+        val path = Path().apply {
+            moveTo(w * 0.04f, y)
+            lineTo(w * 0.22f, y)
+            lineTo(w * 0.30f, h * 0.38f)
+            lineTo(w * 0.38f, h * 0.74f)
+            lineTo(w * 0.48f, h * 0.18f)
+            lineTo(w * 0.58f, y)
+            lineTo(w * 0.94f, y)
+        }
+        drawPath(
+            path = path,
+            color = color,
+            style = Stroke(
+                width = 2.4.dp.toPx(),
+                cap = StrokeCap.Round,
+                join = StrokeJoin.Round
+            )
+        )
+        if (active) {
+            drawCircle(
+                color = color,
+                radius = 2.7.dp.toPx(),
+                center = androidx.compose.ui.geometry.Offset(w * sweep, y)
+            )
         }
     }
 }
@@ -733,59 +1392,175 @@ private fun EditableMetricBlock(
     cardHeight: Dp,
     modifier: Modifier = Modifier
 ) {
+    val accentColor = Color(0xFFA7C7FF)
+    val shape = RoundedCornerShape(8.dp)
     Box(
         modifier = modifier
             .height(cardHeight)
+            .clip(shape)
             .background(
-                color = Color(0xFFF3F3F3),
-                shape = RoundedCornerShape(20.dp)
+                brush = Brush.linearGradient(
+                    colors = listOf(Color(0xFF151922), Color(0xFF0C0F15))
+                ),
+                shape = shape
             )
+            .border(width = 1.dp, color = accentColor.copy(alpha = 0.38f), shape = shape)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
+                .padding(horizontal = 12.dp, vertical = 9.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
             Text(
                 text = title,
-                style = AppTypography.bodySmall,
+                style = AppTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
                 textAlign = TextAlign.Center,
-                color = Color.Black
+                color = accentColor
             )
             Spacer(modifier = Modifier.height(4.dp))
-            lines.forEach { line ->
+            lines.forEachIndexed { index, line ->
                 Text(
                     text = line,
-                    style = AppTypography.bodySmall,
+                    style = if (index == 0) {
+                        AppTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold)
+                    } else {
+                        AppTypography.bodySmall
+                    },
                     textAlign = TextAlign.Center,
-                    color = Color.Black
+                    color = if (index == 0) Color.White else Color(0xFFD8DEE9)
                 )
-                Spacer(modifier = Modifier.height(2.dp))
+                if (index != lines.lastIndex) {
+                    Spacer(modifier = Modifier.height(2.dp))
+                }
             }
+            Spacer(modifier = Modifier.height(7.dp))
+            InlineToggleButton(
+                label = buttonLabel,
+                active = true,
+                accentColor = accentColor,
+                onClick = onEditClick
+            )
+        }
+    }
+}
+
+@Composable
+private fun PopupConfigBlock(
+    heartRateMonitoringMode: String,
+    heartRateBaselineIntervalMinutes: Int,
+    onToggleHeartRateMonitoringMode: () -> Unit,
+    showSuccessPopup: Boolean,
+    showFailurePopup: Boolean,
+    onToggleSuccessPopup: () -> Unit,
+    onToggleFailurePopup: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isHighRiskMode = heartRateMonitoringMode == "high_risk"
+    val accentColor = if (isHighRiskMode) Color(0xFFFFB74D) else Color(0xFF9AE6B4)
+    val shape = RoundedCornerShape(8.dp)
+    Box(
+        modifier = modifier
+            .height(214.dp)
+            .clip(shape)
+            .background(
+                brush = Brush.linearGradient(
+                    colors = listOf(Color(0xFF151922), Color(0xFF0C0F15))
+                ),
+                shape = shape
+            )
+            .border(width = 1.dp, color = accentColor.copy(alpha = 0.34f), shape = shape)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = "HR MODE",
+                style = AppTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                textAlign = TextAlign.Center,
+                color = accentColor
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = if (isHighRiskMode) {
+                    "High-risk baseline: 1 min"
+                } else {
+                    "Standard baseline: ${heartRateBaselineIntervalMinutes} mins"
+                },
+                style = AppTypography.bodySmall,
+                textAlign = TextAlign.Center,
+                color = Color(0xFFD8DEE9)
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            InlineToggleButton(
+                label = if (isHighRiskMode) "Use standard" else "Use high-risk",
+                active = isHighRiskMode,
+                accentColor = accentColor,
+                onClick = onToggleHeartRateMonitoringMode
+            )
+            Spacer(modifier = Modifier.height(9.dp))
             Box(
                 modifier = Modifier
-                    .border(
-                        width = 2.dp,
-                        color = Color(0xFF3A5F8A),
-                        shape = RoundedCornerShape(999.dp)
-                    )
-                    .background(
-                        color = Color(0xFFDCEAF8),
-                        shape = RoundedCornerShape(999.dp)
-                    )
-                    .clickable(onClick = onEditClick)
-                    .padding(horizontal = 14.dp, vertical = 8.dp)
-            ) {
-                Text(
-                    text = buttonLabel,
-                    style = AppTypography.bodySmall,
-                    textAlign = TextAlign.Center,
-                    color = Color.Black
-                )
-            }
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(Color.White.copy(alpha = 0.10f))
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "POPUP",
+                style = AppTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                textAlign = TextAlign.Center,
+                color = Color(0xFFA7C7FF)
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            InlineToggleButton(
+                label = if (showSuccessPopup) "Success on" else "Success off",
+                active = showSuccessPopup,
+                accentColor = Color(0xFF9AE6B4),
+                onClick = onToggleSuccessPopup
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            InlineToggleButton(
+                label = if (showFailurePopup) "Failure on" else "Failure off",
+                active = showFailurePopup,
+                accentColor = Color(0xFFFF8A8A),
+                onClick = onToggleFailurePopup
+            )
         }
+    }
+}
+
+@Composable
+private fun InlineToggleButton(
+    label: String,
+    active: Boolean,
+    accentColor: Color = Color(0xFFA7C7FF),
+    onClick: () -> Unit
+) {
+    val shape = RoundedCornerShape(999.dp)
+    val backgroundColor = if (active) accentColor.copy(alpha = 0.22f) else Color(0xFF1A1F27)
+    val borderColor = if (active) accentColor.copy(alpha = 0.72f) else Color(0xFF4B5563)
+    val textColor = if (active) Color.White else Color(0xFFD8DEE9)
+
+    Box(
+        modifier = Modifier
+            .border(width = 2.dp, color = borderColor, shape = shape)
+            .background(color = backgroundColor, shape = shape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 7.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            style = AppTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+            textAlign = TextAlign.Center,
+            color = textColor
+        )
     }
 }
 
@@ -815,11 +1590,22 @@ private fun requiredContinuousPermissions(): Array<String> {
         arrayOf(Manifest.permission.BODY_SENSORS)
     }
 
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        permissions + Manifest.permission.POST_NOTIFICATIONS
+    val bluetoothPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        arrayOf(
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.BLUETOOTH_CONNECT
+        )
     } else {
-        permissions
+        emptyArray()
     }
+
+    val notificationPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        arrayOf(Manifest.permission.POST_NOTIFICATIONS)
+    } else {
+        emptyArray()
+    }
+
+    return permissions + bluetoothPermissions + notificationPermission
 }
 
 private fun hasContinuousPermissions(context: Context): Boolean {
@@ -847,6 +1633,8 @@ private fun buildMissingPermissionsText(context: Context): String {
             HealthPermissions.READ_HEART_RATE -> "READ_HEART_RATE"
             Manifest.permission.BODY_SENSORS -> "BODY_SENSORS"
             Manifest.permission.POST_NOTIFICATIONS -> "POST_NOTIFICATIONS"
+            Manifest.permission.BLUETOOTH_ADVERTISE -> "BLUETOOTH_ADVERTISE"
+            Manifest.permission.BLUETOOTH_CONNECT -> "BLUETOOTH_CONNECT"
             else -> permission
         }
     }
@@ -885,6 +1673,7 @@ private fun previewUiState(
     connectionState: ContinuousConnectionState = ContinuousConnectionState.Connected,
     progressState: ContinuousTrackingProgressState = ContinuousTrackingProgressState.Tracking,
     wearStatusSnapshot: WearStatusSnapshot? = WearStatusSnapshot(isWorn = true, changedAtMillis = 1742288400000L),
+    edaValue: EDAValue? = EDAValue(skinConductance = 0.72f, status = null, timestamp = 1742288400000L),
     edaLabel: EdaWindowLabel? = EdaWindowLabel.STABLE,
     lastEdaUpdateAtMillis: Long? = 1742288400000L,
     skinTempValue: SkinTempValue? = SkinTempValue(
@@ -895,6 +1684,13 @@ private fun previewUiState(
     lastSkinTempUpdateAtMillis: Long? = 1742288400000L,
     heartRateValue: HeartRateValue? = HeartRateValue(heartRate = 78, status = 1, timestamp = 1742288400000L),
     lastHeartRateUpdateAtMillis: Long? = 1742288400000L,
+    heartRateAlertLevel: String = "normal",
+    heartRateRealtimeMonitoring: Boolean = false,
+    heartRateAlertSustainedSeconds: Int = 0,
+    heartRateMonitoringMode: String = "standard",
+    heartRateBaselineIntervalMinutes: Int = 3,
+    showSuccessPopup: Boolean = false,
+    showFailurePopup: Boolean = true,
     ecgSupported: Boolean = true,
     isAnySensorCycleActive: Boolean = false,
     isEcgReadyToStart: Boolean = true,
@@ -911,14 +1707,22 @@ private fun previewUiState(
         connectionState = connectionState,
         progressState = progressState,
         wearStatusSnapshot = wearStatusSnapshot,
+        edaValue = edaValue,
         edaLabel = edaLabel,
         lastEdaUpdateAtMillis = lastEdaUpdateAtMillis,
         skinTempValue = skinTempValue,
         lastSkinTempUpdateAtMillis = lastSkinTempUpdateAtMillis,
         heartRateValue = heartRateValue,
         lastHeartRateUpdateAtMillis = lastHeartRateUpdateAtMillis,
+        heartRateAlertLevel = heartRateAlertLevel,
+        heartRateRealtimeMonitoring = heartRateRealtimeMonitoring,
+        heartRateAlertSustainedSeconds = heartRateAlertSustainedSeconds,
+        heartRateMonitoringMode = heartRateMonitoringMode,
+        heartRateBaselineIntervalMinutes = heartRateBaselineIntervalMinutes,
         uploadHost = "192.168.0.5",
         uploadPort = 5000,
+        showSuccessPopup = showSuccessPopup,
+        showFailurePopup = showFailurePopup,
         ecgSupported = ecgSupported,
         isAnySensorCycleActive = isAnySensorCycleActive,
         isEcgReadyToStart = isEcgReadyToStart,
